@@ -55,7 +55,7 @@ from app.notes.models import Note, NoteSummary, ProcessingRun
 from app.notes.repository import NoteRepository
 from app.services.note_processor import StreamDelta, StreamFinal
 from app.services.session_manager import SessionManager
-from app.ui.dialogs import SettingsDialog
+from app.ui.dialogs import DiagnosticsDialog, SettingsDialog
 from app.ui.widgets import (
     CommandBar,
     HistoryDropdown,
@@ -142,6 +142,8 @@ class MainWindow(QMainWindow):
     # Settings-dialog plumbing.
     _dialog_result = Signal(object, object)  # callback, result-or-exception
     _settings_applied = Signal(object)  # AppSettings
+    # Health monitor → status bar.
+    _health_received = Signal(object)  # HealthSnapshot
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         super().__init__()
@@ -239,6 +241,7 @@ class MainWindow(QMainWindow):
         self.history_dropdown.run_selected.connect(self._show_processing_run)
         self._dialog_result.connect(self._deliver_dialog_result)
         self._settings_applied.connect(self._on_settings_applied)
+        self._health_received.connect(self.status.set_llm_health)
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -318,6 +321,18 @@ class MainWindow(QMainWindow):
         self.vad_checkbox.toggled.connect(self._on_vad_toggled)
         tb.addWidget(self.vad_checkbox)
 
+        # Multi-server switcher. Only meaningful when [[llm_servers]] is
+        # populated; we keep it visible-but-disabled otherwise so users see
+        # how to enable it without hunting through the docs.
+        tb.addWidget(QLabel(" Server: "))
+        self.server_combo = QComboBox(self)
+        self.server_combo.setMinimumContentsLength(20)
+        self.server_combo.setToolTip(
+            "Switch the active LM Studio server (from [[llm_servers]] in config)."
+        )
+        self.server_combo.currentIndexChanged.connect(self._on_server_changed)
+        tb.addWidget(self.server_combo)
+
         tb.addSeparator()
 
         self._task_actions: dict[str, QAction] = {}
@@ -344,6 +359,10 @@ class MainWindow(QMainWindow):
         tools.addAction(self.act_settings)
 
         tools.addSeparator()
+
+        self.act_diagnostics = QAction("&Diagnostics…", self)
+        self.act_diagnostics.triggered.connect(self._on_open_diagnostics)
+        tools.addAction(self.act_diagnostics)
 
         self.act_test_lmstudio = QAction("Test LM Studio Connection…", self)
         self.act_test_lmstudio.triggered.connect(self._on_test_lmstudio)
@@ -372,6 +391,9 @@ class MainWindow(QMainWindow):
         self._session.add_chunk_event_listener(
             lambda kind, ts, rms: self._chunk_event.emit(kind, ts, rms)
         )
+        self._session.add_health_listener(
+            lambda snapshot: self._health_received.emit(snapshot)
+        )
         self.status.set_providers(
             self._session.transcription_provider.provider_key,
             self._session.llm_provider.provider_key,
@@ -379,7 +401,16 @@ class MainWindow(QMainWindow):
         self._state_changed.emit("Idle")
         self.status.set_message("Session manager ready")
         self._populate_mic_combo()
+        self._populate_server_combo()
         self._reload_notes_async()
+        # Kick off periodic LM Studio health probes on the worker loop.
+        try:
+            self._submit(
+                self._session.start_health_monitor(),
+                "Could not start health monitor",
+            )
+        except Exception:
+            log.exception("Could not schedule health monitor start")
 
     # ----- toolbar handlers ------------------------------------------------
 
@@ -602,6 +633,89 @@ class MainWindow(QMainWindow):
             f"(threshold {session.vad_threshold:.3f})",
             timeout_ms=3000,
         )
+
+    # ----- multi-server picker ------------------------------------------
+
+    def _populate_server_combo(self) -> None:
+        """Populate the toolbar server combo from ``settings.llm_servers``."""
+        self.server_combo.blockSignals(True)
+        try:
+            self.server_combo.clear()
+            servers = self.settings.llm_servers
+            if not servers:
+                # Show the legacy single server but keep the combo disabled —
+                # there's nothing to switch to.
+                self.server_combo.addItem(
+                    f"(single) {self.settings.lmstudio.base_url}",
+                    userData=-1,
+                )
+                self.server_combo.setEnabled(False)
+                return
+            for idx, srv in enumerate(servers):
+                label = srv.name or srv.base_url
+                self.server_combo.addItem(label, userData=idx)
+            active = self.settings.llm.active_server
+            if 0 <= active < self.server_combo.count():
+                self.server_combo.setCurrentIndex(active)
+            self.server_combo.setEnabled(True)
+        finally:
+            self.server_combo.blockSignals(False)
+
+    @Slot(int)
+    def _on_server_changed(self, index: int) -> None:
+        session = self._session
+        if session is None:
+            return
+        target = self.server_combo.itemData(index)
+        if not isinstance(target, int) or target < 0:
+            return  # the "single server" fallback row
+        if session.state.value in ("recording", "paused"):
+            self._show_error(
+                "Stop the recording before switching LM Studio servers."
+            )
+            # Roll the combo back to whatever's actually live.
+            self._populate_server_combo()
+            return
+
+        async def _do() -> None:
+            await session.select_server(target)
+
+        future = self._submit(_do(), "Could not switch server")
+        if future is None:
+            return
+
+        def _done(fut) -> None:
+            try:
+                fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"Could not switch server: {exc}")
+                return
+            new = self.settings.model_copy(deep=True)
+            new.llm.active_server = target
+            self._settings_applied.emit(new)
+            self.settings = new
+            self.status.set_message(
+                f"Switched LM Studio → {new.active_server_label()}",
+                timeout_ms=4000,
+            )
+
+        future.add_done_callback(_done)
+
+    # ----- diagnostics dialog -------------------------------------------
+
+    @Slot()
+    def _on_open_diagnostics(self) -> None:
+        if self._session is None:
+            self._show_error("Session not initialized yet — try again in a moment.")
+            return
+        dialog = DiagnosticsDialog(
+            self.settings, run_async=self._dialog_run_async, parent=self
+        )
+        dialog.show()
+        if not hasattr(self, "_open_dialogs"):
+            self._open_dialogs = []
+        self._open_dialogs.append(dialog)
+        dialog.finished.connect(lambda _r: self._open_dialogs.remove(dialog))
 
     # ----- chunk-event indicator ----------------------------------------
 
@@ -966,6 +1080,7 @@ class MainWindow(QMainWindow):
         finally:
             self.vad_checkbox.blockSignals(False)
         self._populate_mic_combo()
+        self._populate_server_combo()
         self.status.set_message("Settings applied.", timeout_ms=4000)
 
     # ----- processing-runs history --------------------------------------

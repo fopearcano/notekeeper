@@ -52,6 +52,12 @@ def session(monkeypatch):
     sm.llm_provider = _FakeLLM()
     sm.note_processor.provider = sm.llm_provider
 
+    # No LM Studio reachable in tests — short-circuit the post-action probe.
+    async def _fake_probe():
+        return sm.health_monitor.snapshot
+
+    sm.health_monitor.probe_once = _fake_probe  # type: ignore[assignment]
+
     yield sm
 
     db.close()

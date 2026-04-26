@@ -43,6 +43,13 @@ def session(monkeypatch):
     db = Database(":memory:")
     repo = NoteRepository(db)
     sm = SessionManager(settings, repo)
+    # Tests don't have an LM Studio reachable on the LAN — short-circuit the
+    # post-action and post-apply probes so they don't burn 3s on httpx
+    # default timeouts.
+    async def _fake_probe():
+        return sm.health_monitor.snapshot
+
+    sm.health_monitor.probe_once = _fake_probe  # type: ignore[assignment]
     yield sm
     db.close()
 
@@ -249,3 +256,40 @@ def test_apply_settings_picks_up_new_sample_rate(session):
     )
     asyncio.run(session.apply_settings(new_settings))
     assert session.recorder.sample_rate == 22050
+
+
+# ---------- multi-server ---------------------------------------------------
+
+
+def test_select_server_switches_active_index(session):
+    """Calling select_server applies the new index and rebuilds the provider."""
+    new_settings = load_settings(
+        bootstrap=False,
+        overrides={
+            "llm_servers": [
+                {"name": "A", "base_url": "http://10.0.0.1/v1", "provider": "lmstudio"},
+                {"name": "B", "base_url": "http://10.0.0.2/v1", "provider": "lmstudio"},
+            ],
+        },
+    )
+    asyncio.run(session.apply_settings(new_settings))
+    assert session.llm_provider.settings.base_url == "http://10.0.0.1/v1"
+
+    asyncio.run(session.select_server(1))
+
+    assert session.settings.llm.active_server == 1
+    assert session.llm_provider.settings.base_url == "http://10.0.0.2/v1"
+
+
+def test_select_server_rejects_out_of_range(session):
+    new_settings = load_settings(
+        bootstrap=False,
+        overrides={
+            "llm_servers": [
+                {"name": "A", "base_url": "http://10.0.0.1/v1", "provider": "lmstudio"},
+            ],
+        },
+    )
+    asyncio.run(session.apply_settings(new_settings))
+    with pytest.raises(IndexError):
+        asyncio.run(session.select_server(5))

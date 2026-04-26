@@ -23,6 +23,11 @@ from app.audio.audio_buffer import AudioBuffer
 from app.audio.recorder import AudioRecorder, RecorderState
 from app.audio.vad import build_default_vad
 from app.config.settings import AppSettings
+from app.services.health_monitor import (
+    HealthMonitor,
+    HealthSnapshot,
+    LLMServerStatus,
+)
 from app.llm.factory import create_llm_provider
 from app.llm.prompt_templates import StructuredOutput, render_template
 from app.notes.models import (
@@ -47,6 +52,7 @@ WarningCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
 NoteSavedCallback = Callable[[Note], None]
 ChunkEventCallback = Callable[[str, float, float], None]
+HealthCallback = Callable[[HealthSnapshot], None]
 
 
 class SessionState(enum.Enum):
@@ -85,6 +91,7 @@ class SessionManager:
 
         self.llm_provider = create_llm_provider(settings)
         self.note_processor = NoteProcessor(self.llm_provider)
+        self.health_monitor = HealthMonitor(settings.active_lmstudio_settings())
 
         self._state = SessionState.IDLE
         self._lock = threading.Lock()
@@ -96,6 +103,8 @@ class SessionManager:
         self._status_listeners: list[StatusCallback] = []
         self._note_saved_listeners: list[NoteSavedCallback] = []
         self._chunk_event_listeners: list[ChunkEventCallback] = []
+        self._health_listeners: list[HealthCallback] = []
+        self.health_monitor.add_listener(self._on_health_snapshot)
 
         # Persistent note pointer. None = nothing saved yet for this run.
         self._current_note_id: Optional[int] = None
@@ -166,6 +175,28 @@ class SessionManager:
             self._chunk_event_listeners.remove(listener)
         except ValueError:
             pass
+
+    def add_health_listener(self, listener: HealthCallback) -> None:
+        self._health_listeners.append(listener)
+        # Replay current snapshot for late subscribers (Qt signal connections
+        # are made after SessionManager is constructed).
+        try:
+            listener(self.health_monitor.snapshot)
+        except Exception:
+            log.exception("Health listener raised on attach")
+
+    def remove_health_listener(self, listener: HealthCallback) -> None:
+        try:
+            self._health_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def _on_health_snapshot(self, snapshot: HealthSnapshot) -> None:
+        for cb in list(self._health_listeners):
+            try:
+                cb(snapshot)
+            except Exception:
+                log.exception("Health UI listener raised")
 
     # ----- internal callbacks (run on recorder / pipeline threads) ------
 
@@ -349,6 +380,7 @@ class SessionManager:
         log.info("Session cleared")
 
     async def aclose(self) -> None:
+        await self.health_monitor.stop()
         await self.note_processor.aclose()
 
     async def apply_settings(self, new_settings: AppSettings) -> None:
@@ -415,12 +447,39 @@ class SessionManager:
         self.llm_provider = create_llm_provider(new_settings)
         self.note_processor = NoteProcessor(self.llm_provider)
 
+        # Repoint the existing health monitor at the new active server so
+        # the status indicator updates without rebuilding the periodic task.
+        self.health_monitor.update_settings(new_settings.active_lmstudio_settings())
+        try:
+            await self.health_monitor.probe_once()
+        except Exception:
+            log.exception("Health probe raised during apply_settings")
+
         log.info(
-            "Settings reloaded (transcription=%s [stub=%s], llm=%s)",
+            "Settings reloaded (transcription=%s [stub=%s], llm=%s, active_server=%s)",
             self.transcription_provider.provider_key,
             self.transcription_provider.is_stub,
             self.llm_provider.provider_key,
+            new_settings.active_server_label(),
         )
+
+    async def start_health_monitor(self) -> None:
+        """Begin periodic health probes (idempotent)."""
+        self.health_monitor.start()
+        # Kick off an immediate probe so the UI doesn't sit on UNKNOWN for
+        # the full interval before the first paint.
+        try:
+            await self.health_monitor.probe_once()
+        except Exception:
+            log.exception("Initial health probe raised")
+
+    async def select_server(self, index: int) -> None:
+        """Switch the active LM Studio server and re-apply settings."""
+        if not 0 <= index < len(self.settings.llm_servers):
+            raise IndexError(f"server index {index} out of range")
+        new_settings = self.settings.model_copy(deep=True)
+        new_settings.llm.active_server = index
+        await self.apply_settings(new_settings)
 
     # ----- persistence ---------------------------------------------------
 
@@ -569,12 +628,27 @@ class SessionManager:
         """
         action = action or self.settings.llm.default_task
         transcript = text if text is not None else self.transcript_text()
-        result = await self.note_processor.process(
-            action=action,
-            transcript=transcript,
-            title=title,
-            instruction=instruction,
-        )
+
+        self.health_monitor.set_status_override(LLMServerStatus.GENERATING)
+        try:
+            result = await self.note_processor.process(
+                action=action,
+                transcript=transcript,
+                title=title,
+                instruction=instruction,
+            )
+        except Exception as exc:
+            self.health_monitor.set_status_override(
+                LLMServerStatus.ERROR, error=f"{type(exc).__name__}: {exc}"
+            )
+            raise
+
+        # Restore real status by triggering a fresh probe on the worker loop.
+        try:
+            await self.health_monitor.probe_once()
+        except Exception:
+            log.exception("Health probe raised after run_action")
+
         self._record_processing_run(
             action=action, transcript=transcript, output=result, instruction=instruction
         )
@@ -605,15 +679,29 @@ class SessionManager:
         action = action or self.settings.llm.default_task
         transcript = text if text is not None else self.transcript_text()
         last_final: Optional[StreamFinal] = None
-        async for event in self.note_processor.process_streaming(
-            action=action,
-            transcript=transcript,
-            title=title,
-            instruction=instruction,
-        ):
-            if isinstance(event, StreamFinal):
-                last_final = event
-            yield event
+
+        self.health_monitor.set_status_override(LLMServerStatus.GENERATING)
+        try:
+            async for event in self.note_processor.process_streaming(
+                action=action,
+                transcript=transcript,
+                title=title,
+                instruction=instruction,
+            ):
+                if isinstance(event, StreamFinal):
+                    last_final = event
+                yield event
+        except Exception as exc:
+            self.health_monitor.set_status_override(
+                LLMServerStatus.ERROR, error=f"{type(exc).__name__}: {exc}"
+            )
+            raise
+
+        # Stream finished; refresh status from a real probe.
+        try:
+            await self.health_monitor.probe_once()
+        except Exception:
+            log.exception("Health probe raised after stream_action")
 
         if last_final is not None:
             self._record_processing_run(

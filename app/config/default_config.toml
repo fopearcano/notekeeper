@@ -54,6 +54,20 @@ api_key = "lm-studio"
 model = "local-model-name"
 timeout_seconds = 120
 
+# Optional: define multiple LM Studio servers and switch between them
+# from the toolbar. ``llm.active_server`` indexes this list (0 = first).
+# Empty/zero per-entry fields fall through to the [lmstudio] defaults.
+#
+# [[llm_servers]]
+# name = "Local 3090 Server"
+# base_url = "http://192.168.1.100:1234/v1"
+# provider = "lmstudio"
+#
+# [[llm_servers]]
+# name = "Backup Server"
+# base_url = "http://192.168.1.101:1234/v1"
+# provider = "lmstudio"
+
 [openai]
 api_key_env = "OPENAI_API_KEY"
 model = "gpt-4.1-mini"

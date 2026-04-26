@@ -96,16 +96,41 @@ def _format_section(name: str, fields: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def dumps_toml(data: Mapping[str, Mapping[str, Any]]) -> str:
-    """Serialize a ``{section: {key: value}}`` mapping to a TOML string."""
-    blocks: list[list[str]] = []
+def _format_array_of_tables(name: str, item: Mapping[str, Any]) -> list[str]:
+    lines = [f"[[{name}]]"]
+    for key, value in item.items():
+        if value is None:
+            lines.append(f"# {key} = null")
+            continue
+        lines.append(f"{key} = {_format_value(value)}")
+    return lines
+
+
+def dumps_toml(data: Mapping[str, Any]) -> str:
+    """Serialize a ``{section: {key: value}}`` mapping to a TOML string.
+
+    Top-level values that are lists of mappings are emitted as
+    ``[[arrays-of-tables]]``; other top-level values must be mappings.
+    """
+    table_blocks: list[list[str]] = []
+    array_blocks: list[list[str]] = []
     for section, fields in data.items():
+        if isinstance(fields, list):
+            for item in fields:
+                if not isinstance(item, Mapping):
+                    raise TypeError(
+                        f"Items of array-of-tables {section!r} must be mappings, "
+                        f"got {type(item).__name__}"
+                    )
+                array_blocks.append(_format_array_of_tables(section, item))
+            continue
         if not isinstance(fields, Mapping):
             raise TypeError(
-                f"Top-level value for {section!r} must be a mapping, "
+                f"Top-level value for {section!r} must be a mapping or list of mappings, "
                 f"got {type(fields).__name__}"
             )
-        blocks.append(_format_section(section, fields))
+        table_blocks.append(_format_section(section, fields))
+    blocks = table_blocks + array_blocks
     return "\n\n".join("\n".join(block) for block in blocks) + "\n"
 
 
@@ -121,7 +146,7 @@ def settings_to_toml_dict(settings: AppSettings) -> dict[str, dict[str, Any]]:
     ``~/.notekeeper/config.toml`` after a Settings-dialog save shows only
     the lines the user actually changed.
     """
-    return {
+    out: dict[str, Any] = {
         "app": settings.app.model_dump(),
         "ui": settings.ui.model_dump(),
         "audio": settings.audio.model_dump(),
@@ -135,6 +160,9 @@ def settings_to_toml_dict(settings: AppSettings) -> dict[str, dict[str, Any]]:
         "anthropic": settings.anthropic.model_dump(),
         "storage": settings.storage.model_dump(),
     }
+    if settings.llm_servers:
+        out["llm_servers"] = [s.model_dump() for s in settings.llm_servers]
+    return out
 
 
 def save_settings(

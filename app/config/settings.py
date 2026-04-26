@@ -130,6 +130,28 @@ class LMStudioAudioSettings(BaseModel):
 class LLMSettings(BaseModel):
     provider: LLMProviderName = "lmstudio"
     default_task: str = "clean"
+    #: Index into ``llm_servers`` selecting the active LM Studio server.
+    #: Ignored when ``llm_servers`` is empty.
+    active_server: int = Field(default=0, ge=0)
+
+
+class LLMServer(BaseModel):
+    """One LM Studio server (or compatible) on the LAN.
+
+    A list of these lives at the top level under ``[[llm_servers]]``.
+    When non-empty, the entry at ``llm.active_server`` overrides
+    ``[lmstudio]`` for the LLM factory; setting an out-of-range index
+    falls back to the legacy single-server config silently.
+    """
+
+    name: str
+    base_url: str
+    provider: Literal["lmstudio"] = "lmstudio"
+    api_key: str = "lm-studio"
+    #: ``""`` means "use the model from ``[lmstudio]``".
+    model: str = ""
+    #: ``0`` means "use the timeout from ``[lmstudio]``".
+    timeout_seconds: int = Field(default=0, ge=0)
 
 
 class LMStudioLLMSettings(BaseModel):
@@ -179,6 +201,36 @@ class AppSettings(BaseModel):
     lmstudio: LMStudioLLMSettings = Field(default_factory=LMStudioLLMSettings)
     openai: OpenAILLMSettings = Field(default_factory=OpenAILLMSettings)
     anthropic: AnthropicLLMSettings = Field(default_factory=AnthropicLLMSettings)
+    llm_servers: list[LLMServer] = Field(default_factory=list)
+
+    def active_lmstudio_settings(self) -> LMStudioLLMSettings:
+        """Return the effective LM Studio settings.
+
+        When ``llm_servers`` is non-empty and ``llm.active_server`` is in
+        range, the matching ``LLMServer`` overrides
+        :pyattr:`AppSettings.lmstudio` (with empty / zero fields falling
+        through to the base ``[lmstudio]`` section so users only set the
+        fields they want to override per server).
+        """
+        base = self.lmstudio
+        if not self.llm_servers:
+            return base
+        if not 0 <= self.llm.active_server < len(self.llm_servers):
+            return base
+        server = self.llm_servers[self.llm.active_server]
+        return LMStudioLLMSettings(
+            base_url=server.base_url,
+            api_key=server.api_key or base.api_key,
+            model=server.model or base.model,
+            timeout_seconds=server.timeout_seconds or base.timeout_seconds,
+        )
+
+    def active_server_label(self) -> str:
+        """Display label of the active server (falls back to base_url)."""
+        if self.llm_servers and 0 <= self.llm.active_server < len(self.llm_servers):
+            srv = self.llm_servers[self.llm.active_server]
+            return srv.name or srv.base_url
+        return self.lmstudio.base_url
 
 
 # --------------------------------------------------------------------------- #
