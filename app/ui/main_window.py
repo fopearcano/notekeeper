@@ -55,6 +55,7 @@ from app.notes.models import Note, NoteSummary, ProcessingRun
 from app.notes.repository import NoteRepository
 from app.services.note_processor import StreamDelta, StreamFinal
 from app.services.session_manager import SessionManager
+from app.ui.dialogs import SettingsDialog
 from app.ui.widgets import (
     CommandBar,
     HistoryDropdown,
@@ -138,6 +139,9 @@ class MainWindow(QMainWindow):
     _notes_listed = Signal(list)  # list[NoteSummary]
     # Live-capture chunk events (pipeline → UI).
     _chunk_event = Signal(str, float, float)  # kind, timestamp, rms
+    # Settings-dialog plumbing.
+    _dialog_result = Signal(object, object)  # callback, result-or-exception
+    _settings_applied = Signal(object)  # AppSettings
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         super().__init__()
@@ -233,6 +237,8 @@ class MainWindow(QMainWindow):
         self._chunk_event.connect(self._on_chunk_event)
         self.command_bar.command_submitted.connect(self._on_command_submitted)
         self.history_dropdown.run_selected.connect(self._show_processing_run)
+        self._dialog_result.connect(self._deliver_dialog_result)
+        self._settings_applied.connect(self._on_settings_applied)
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -331,6 +337,14 @@ class MainWindow(QMainWindow):
     def _build_menu_bar(self) -> None:
         bar: QMenuBar = self.menuBar()
         tools = bar.addMenu("&Tools")
+
+        self.act_settings = QAction("&Settings…", self)
+        self.act_settings.setShortcut(QKeySequence("Ctrl+,"))
+        self.act_settings.triggered.connect(self._on_open_settings)
+        tools.addAction(self.act_settings)
+
+        tools.addSeparator()
+
         self.act_test_lmstudio = QAction("Test LM Studio Connection…", self)
         self.act_test_lmstudio.triggered.connect(self._on_test_lmstudio)
         tools.addAction(self.act_test_lmstudio)
@@ -868,6 +882,91 @@ class MainWindow(QMainWindow):
         self.status.set_message(
             f"LM Studio: {len(models)} model(s) available", timeout_ms=4000
         )
+
+    # ----- settings dialog ------------------------------------------------
+
+    @Slot()
+    def _on_open_settings(self) -> None:
+        session = self._require_session()
+        if session is None:
+            return
+
+        dialog = SettingsDialog(
+            self.settings, run_async=self._dialog_run_async, parent=self
+        )
+        dialog.settings_saved.connect(self._on_settings_saved)
+        dialog.show()
+        # Hold a reference so non-modal dialogs aren't garbage-collected.
+        if not hasattr(self, "_open_dialogs"):
+            self._open_dialogs = []
+        self._open_dialogs.append(dialog)
+        dialog.finished.connect(lambda _r: self._open_dialogs.remove(dialog))
+
+    def _dialog_run_async(self, coro, on_done) -> None:
+        """Bridge the dialog's :class:`RunAsync` contract onto the worker loop."""
+        future = self._submit(coro, "Settings test failed")
+        if future is None:
+            on_done(RuntimeError("Worker not ready"))
+            return
+
+        def _bounce(fut) -> None:
+            try:
+                result = fut.result()
+            except Exception as exc:
+                # Marshal back to the GUI thread before touching widgets.
+                self._dialog_result.emit(on_done, exc)
+                return
+            self._dialog_result.emit(on_done, result)
+
+        future.add_done_callback(_bounce)
+
+    @Slot(object, object)
+    def _deliver_dialog_result(self, on_done, result) -> None:
+        on_done(result)
+
+    @Slot(object)
+    def _on_settings_saved(self, new_settings) -> None:
+        """Apply the new settings to the live session."""
+        session = self._session
+        if session is None:
+            return
+        if session.state.value in ("recording", "paused"):
+            self._show_error(
+                "Stop the recording before applying new settings."
+            )
+            return
+
+        async def _do() -> None:
+            await session.apply_settings(new_settings)
+
+        future = self._submit(_do(), "Could not apply settings")
+        if future is None:
+            return
+
+        def _done(fut) -> None:
+            try:
+                fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"Could not apply settings: {exc}")
+                return
+            self.settings = new_settings
+            # Refresh derived UI bits that don't go through listeners.
+            self._settings_applied.emit(new_settings)
+
+        future.add_done_callback(_done)
+
+    @Slot(object)
+    def _on_settings_applied(self, new_settings) -> None:
+        self.status.set_providers(
+            new_settings.transcription.provider, new_settings.llm.provider
+        )
+        self.vad_checkbox.blockSignals(True)
+        try:
+            self.vad_checkbox.setChecked(new_settings.audio.vad_enabled)
+        finally:
+            self.vad_checkbox.blockSignals(False)
+        self._populate_mic_combo()
+        self.status.set_message("Settings applied.", timeout_ms=4000)
 
     # ----- processing-runs history --------------------------------------
 

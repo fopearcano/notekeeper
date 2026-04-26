@@ -1,5 +1,6 @@
 """Configuration package."""
 
+from app.config.io import dumps_toml, save_settings, settings_to_toml_dict
 from app.config.settings import (
     AnthropicLLMSettings,
     AppSettings,
@@ -33,7 +34,10 @@ __all__ = [
     "TranscriptionSettings",
     "UISettings",
     "default_user_config_path",
+    "dumps_toml",
     "ensure_user_config",
     "load_settings",
+    "save_settings",
+    "settings_to_toml_dict",
     "user_data_dir",
 ]

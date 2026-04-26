@@ -351,6 +351,77 @@ class SessionManager:
     async def aclose(self) -> None:
         await self.note_processor.aclose()
 
+    async def apply_settings(self, new_settings: AppSettings) -> None:
+        """Replace the live providers / recorder config from ``new_settings``.
+
+        Refuses while the session is recording or paused — config changes
+        that affect the audio pipeline (sample rate, chunk seconds,
+        transcription provider) must not happen mid-stream. Stop first.
+
+        After this returns:
+        * ``self.settings`` is the new settings object.
+        * ``self.transcription_provider`` and ``self.llm_provider`` have
+          been re-created from the new settings.
+        * The pipeline is rebuilt around the new transcription provider
+          and re-attached to the existing ``_buffer`` and the same
+          internal callback dispatch path, so external listeners (UI
+          subscribers) continue to receive events without re-subscribing.
+        * The recorder picks up the new audio + sample-rate settings
+          on the next :meth:`start` call.
+        * VAD enabled / threshold are updated in-place.
+        """
+        if self._state in (SessionState.RECORDING, SessionState.PAUSED):
+            raise RuntimeError(
+                "Stop the recording before applying new settings."
+            )
+
+        # Tear down the old LLM client so its httpx connection pool closes
+        # cleanly. The transcription provider's ``stop`` is a no-op when the
+        # pipeline isn't running, but call it for symmetry.
+        try:
+            await self.note_processor.aclose()
+        except Exception:
+            log.exception("Error closing previous LLM provider")
+        try:
+            await self.transcription_provider.stop()
+        except Exception:
+            log.exception("Error stopping previous transcription provider")
+
+        self.settings = new_settings
+
+        # Recorder: update settings + sample rate / chunk for the next start.
+        self.recorder.settings = new_settings.audio
+        self.recorder.sample_rate = new_settings.transcription.sample_rate
+        self.recorder.chunk_seconds = new_settings.transcription.chunk_seconds
+
+        # VAD is runtime-mutable; just update its knobs in place.
+        self.vad.set_enabled(new_settings.audio.vad_enabled)
+        self.vad.set_threshold(new_settings.audio.vad_threshold)
+
+        # Rebuild the transcription provider + pipeline. The pipeline wires
+        # ``provider.set_warning_callback`` / ``set_status_callback`` in its
+        # __init__ so the new provider's side channels reach the existing
+        # listener lists.
+        self.transcription_provider = create_transcription_provider(new_settings)
+        self.pipeline = TranscriptPipeline(
+            self.transcription_provider, self._buffer, vad=self.vad
+        )
+        self.pipeline.add_listener(self._on_segment)
+        self.pipeline.add_warning_listener(self._on_warning)
+        self.pipeline.add_status_listener(self._on_status)
+        self.pipeline.add_chunk_listener(self._on_chunk_event)
+
+        # Rebuild the LLM provider + processor.
+        self.llm_provider = create_llm_provider(new_settings)
+        self.note_processor = NoteProcessor(self.llm_provider)
+
+        log.info(
+            "Settings reloaded (transcription=%s [stub=%s], llm=%s)",
+            self.transcription_provider.provider_key,
+            self.transcription_provider.is_stub,
+            self.llm_provider.provider_key,
+        )
+
     # ----- persistence ---------------------------------------------------
 
     @staticmethod
