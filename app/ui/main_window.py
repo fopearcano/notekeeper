@@ -21,30 +21,47 @@ import asyncio
 from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenuBar,
     QMessageBox,
+    QPlainTextEdit,
     QSplitter,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
 from app.audio.recorder import list_input_devices
 from app.config.settings import AppSettings
+from app.llm.commands import (
+    CommandError,
+    command_help,
+    is_command,
+    merge_instructions,
+    resolve_command,
+)
 from app.llm.prompt_templates import UI_TASKS
-from app.notes.models import Note, NoteSummary
+from app.notes.models import Note, NoteSummary, ProcessingRun
 from app.notes.repository import NoteRepository
 from app.services.note_processor import StreamDelta, StreamFinal
 from app.services.session_manager import SessionManager
-from app.ui.widgets import NoteEditor, NotekeeperStatusBar, TranscriptView
+from app.ui.widgets import (
+    CommandBar,
+    HistoryDropdown,
+    NoteEditor,
+    NotekeeperStatusBar,
+    TranscriptView,
+)
 from app.utils.logging import get_logger
 
 #: Autosave cadence while recording (milliseconds).
@@ -138,15 +155,27 @@ class MainWindow(QMainWindow):
 
         self.transcript_view = TranscriptView()
         self.note_editor = NoteEditor()
+        self.command_bar = CommandBar()
+        self.history_dropdown = HistoryDropdown()
+
+        # Right column: history picker on top, processed-note editor in the
+        # middle, command bar at the bottom (where the user's eye lands when
+        # they finish reading the result).
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.history_dropdown)
+        right_layout.addWidget(self.note_editor, stretch=1)
+        right_layout.addWidget(self.command_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.notes_list)
         splitter.addWidget(self.transcript_view)
-        splitter.addWidget(self.note_editor)
+        splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 2)
-        splitter.setSizes([220, 600, 400])
+        splitter.setSizes([220, 600, 460])
 
         container = QWidget()
         from PySide6.QtWidgets import QHBoxLayout
@@ -202,6 +231,8 @@ class MainWindow(QMainWindow):
         self._note_loaded.connect(self._on_note_loaded)
         self._notes_listed.connect(self._refresh_sidebar)
         self._chunk_event.connect(self._on_chunk_event)
+        self.command_bar.command_submitted.connect(self._on_command_submitted)
+        self.history_dropdown.run_selected.connect(self._show_processing_run)
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -227,6 +258,9 @@ class MainWindow(QMainWindow):
         self.act_save = QAction("Save Note", self)
         self.act_pause.setEnabled(False)
         self.act_stop.setEnabled(False)
+
+        self.act_save.setShortcut(QKeySequence("Ctrl+S"))
+
         for act in (
             self.act_start,
             self.act_pause,
@@ -235,6 +269,27 @@ class MainWindow(QMainWindow):
             self.act_save,
         ):
             tb.addAction(act)
+
+        # ``Ctrl+R`` is a single user-facing action that toggles record/stop
+        # depending on session state. It's not on the toolbar (Start/Stop are
+        # already there), but ``self.addAction`` makes it active everywhere.
+        self.act_toggle_record = QAction("Toggle Recording", self)
+        self.act_toggle_record.setShortcut(QKeySequence("Ctrl+R"))
+        self.act_toggle_record.triggered.connect(self._on_toggle_record)
+        self.addAction(self.act_toggle_record)
+
+        # ``Ctrl+Shift+C`` cleans the current selection / transcript.
+        self.act_clean_shortcut = QAction("Clean Transcript", self)
+        self.act_clean_shortcut.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        self.act_clean_shortcut.triggered.connect(lambda: self._on_run_action("clean"))
+        self.addAction(self.act_clean_shortcut)
+
+        # ``Ctrl+Enter`` runs whatever is in the command bar — installed as a
+        # window-wide action so it works regardless of focus.
+        self.act_run_command = QAction("Run Command", self)
+        self.act_run_command.setShortcut(QKeySequence("Ctrl+Return"))
+        self.act_run_command.triggered.connect(self.command_bar.submit)
+        self.addAction(self.act_run_command)
 
         tb.addSeparator()
 
@@ -327,6 +382,7 @@ class MainWindow(QMainWindow):
             return
         self.transcript_view.clear()
         self.note_editor.clear()
+        self.history_dropdown.clear()
         self.act_start.setEnabled(False)
         self.act_stop.setEnabled(True)
         self.act_pause.setEnabled(True)
@@ -415,6 +471,8 @@ class MainWindow(QMainWindow):
         def _done(_fut) -> None:
             self.transcript_view.clear()
             self.note_editor.clear()
+            self.history_dropdown.clear()
+            self.command_bar.clear_inputs()
             self.status.set_elapsed(0.0)
             self.status.set_level(0.0)
             self.act_start.setEnabled(True)
@@ -643,29 +701,57 @@ class MainWindow(QMainWindow):
             tags=note.tags,
         )
         self.status.set_message(f"Loaded note #{note.id} — {note.title}")
+        self._refresh_history_async()
 
     @Slot(object)
     def _on_note_saved(self, _note: Note) -> None:
         self._reload_notes_async()
+        self._refresh_history_async()
 
-    def _on_run_action(self, action: str) -> None:
+    # ----- text source for actions --------------------------------------
+
+    def _collect_action_text(self) -> str:
+        """Pick the best text to feed an action.
+
+        Priority: transcript-view selection → note-editor selection →
+        whole transcript view contents.
+        """
+        for source in (
+            self.transcript_view.selected_text(),
+            self.note_editor.selected_text(),
+        ):
+            if source and source.strip():
+                return source.strip()
+        return self.transcript_view.text().strip()
+
+    def _run_action_with_text(
+        self,
+        action: str,
+        *,
+        text: str,
+        instruction: str = "",
+        label: Optional[str] = None,
+    ) -> None:
+        """Shared streaming-action driver used by toolbar buttons + commands."""
         session = self._require_session()
         if session is None:
             return
-        transcript = self.transcript_view.text().strip()
-        if not transcript:
-            self._show_error("Nothing to process — record or paste a transcript first.")
+        if not text:
+            self._show_error("Nothing to process — record, type, or select some text first.")
             return
 
-        label = self._TASK_LABELS.get(action, action)
+        label = label or self._TASK_LABELS.get(action, action.replace("_", " ").title())
         self._set_tasks_enabled(False)
+        self.command_bar.set_busy(True)
         self._stream_started.emit()
         self.status.set_message(f"{label}…", timeout_ms=0)
 
         async def _drive() -> tuple[str, list[str]]:
             title = ""
             tags: list[str] = []
-            async for event in session.stream_action(action):
+            async for event in session.stream_action(
+                action, text=text, instruction=instruction or None
+            ):
                 if isinstance(event, StreamDelta):
                     self._stream_delta.emit(event.text)
                 elif isinstance(event, StreamFinal):
@@ -676,10 +762,12 @@ class MainWindow(QMainWindow):
         future = self._submit(_drive(), f"{action} failed")
         if future is None:
             self._set_tasks_enabled(True)
+            self.command_bar.set_busy(False)
             return
 
         def _done(fut) -> None:
             self._set_tasks_enabled(True)
+            self.command_bar.set_busy(False)
             try:
                 title, tags = fut.result()
             except Exception as exc:
@@ -689,6 +777,39 @@ class MainWindow(QMainWindow):
             self.status.set_message(f"{label} done", timeout_ms=4000)
 
         future.add_done_callback(_done)
+
+    def _on_run_action(self, action: str) -> None:
+        """Toolbar entry point: run ``action`` over the selection or full transcript."""
+        self._run_action_with_text(action, text=self._collect_action_text())
+
+    @Slot(str, str)
+    def _on_command_submitted(self, command_text: str, instruction: str) -> None:
+        """Resolve a slash command and dispatch it."""
+        if not is_command(command_text):
+            self._show_error(
+                f"Commands must start with '/'. Try one of:\n\n{command_help()}"
+            )
+            return
+        try:
+            resolved = resolve_command(command_text)
+        except CommandError as exc:
+            self._show_error(f"{exc}\n\n{command_help()}")
+            return
+
+        merged = merge_instructions(resolved.instruction, instruction)
+        text = self._collect_action_text()
+        label = f"/{resolved.verb}" + (f" {resolved.arg}" if resolved.arg else "")
+        self._run_action_with_text(
+            resolved.template, text=text, instruction=merged, label=label
+        )
+
+    @Slot()
+    def _on_toggle_record(self) -> None:
+        """Ctrl+R: start or stop recording depending on session state."""
+        if self.act_stop.isEnabled():
+            self._on_stop()
+        else:
+            self._on_start()
 
     def _set_tasks_enabled(self, enabled: bool) -> None:
         for action in self._task_actions.values():
@@ -747,6 +868,70 @@ class MainWindow(QMainWindow):
         self.status.set_message(
             f"LM Studio: {len(models)} model(s) available", timeout_ms=4000
         )
+
+    # ----- processing-runs history --------------------------------------
+
+    def _refresh_history_async(self) -> None:
+        session = self._session
+        if session is None:
+            return
+
+        async def _do() -> list[ProcessingRun]:
+            return session.processing_runs()
+
+        future = self._submit(_do(), "Could not load processing history")
+        if future is None:
+            return
+
+        def _done(fut) -> None:
+            try:
+                runs = fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"Could not load processing history: {exc}")
+                return
+            self.history_dropdown.set_runs(runs)
+
+        future.add_done_callback(_done)
+
+    @Slot(object)
+    def _show_processing_run(self, run: ProcessingRun) -> None:
+        """Open a non-modal dialog showing the run's prompt + output."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(
+            f"Run #{run.id} — {run.task} ({run.created_at:%Y-%m-%d %H:%M:%S})"
+        )
+        dialog.resize(720, 520)
+
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel(f"<b>Provider:</b> {run.provider}  ·  "
+                                f"<b>Model:</b> {run.model}"))
+
+        prompt_label = QLabel("Prompt")
+        prompt_label.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        layout.addWidget(prompt_label)
+        prompt_view = QPlainTextEdit(run.prompt)
+        prompt_view.setReadOnly(True)
+        layout.addWidget(prompt_view, stretch=1)
+
+        output_label = QLabel("Output")
+        output_label.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        layout.addWidget(output_label)
+        output_view = QPlainTextEdit(run.output)
+        output_view.setReadOnly(True)
+        layout.addWidget(output_view, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.close)
+        buttons.accepted.connect(dialog.close)
+        layout.addWidget(buttons)
+
+        dialog.show()
+        # Hold a reference so the dialog stays alive after this slot returns.
+        if not hasattr(self, "_open_dialogs"):
+            self._open_dialogs: list[QDialog] = []
+        self._open_dialogs.append(dialog)
+        dialog.finished.connect(lambda _result: self._open_dialogs.remove(dialog))
 
     # ----- helpers ---------------------------------------------------------
 

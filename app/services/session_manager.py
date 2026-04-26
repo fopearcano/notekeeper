@@ -489,10 +489,15 @@ class SessionManager:
         *,
         instruction: Optional[str] = None,
         title: Optional[str] = None,
+        text: Optional[str] = None,
     ) -> StructuredOutput:
-        """Buffered run — returns the parsed :class:`StructuredOutput`."""
+        """Buffered run — returns the parsed :class:`StructuredOutput`.
+
+        ``text`` overrides the live transcript when provided (used by the
+        command bar to feed selected text instead of the whole note).
+        """
         action = action or self.settings.llm.default_task
-        transcript = self.transcript_text()
+        transcript = text if text is not None else self.transcript_text()
         result = await self.note_processor.process(
             action=action,
             transcript=transcript,
@@ -510,6 +515,7 @@ class SessionManager:
         *,
         instruction: Optional[str] = None,
         title: Optional[str] = None,
+        text: Optional[str] = None,
     ):
         """Streaming run.
 
@@ -520,9 +526,13 @@ class SessionManager:
         * ensures a current note exists (auto-creating one if needed),
         * updates the note's processed_text / title / tags,
         * records a :class:`ProcessingRunDraft` row.
+
+        ``text`` overrides the live transcript when supplied — the command
+        bar uses this to run a task on a selected substring while still
+        attributing the resulting processing-run row to the current note.
         """
         action = action or self.settings.llm.default_task
-        transcript = self.transcript_text()
+        transcript = text if text is not None else self.transcript_text()
         last_final: Optional[StreamFinal] = None
         async for event in self.note_processor.process_streaming(
             action=action,
@@ -604,3 +614,12 @@ class SessionManager:
 
     async def list_llm_models(self) -> list[str]:
         return await self.llm_provider.list_models()
+
+    def processing_runs(self):
+        """Return all processing runs for the current note (newest first)."""
+        if self._current_note_id is None:
+            return []
+        runs = self.repository.list_processing_runs(self._current_note_id)
+        # The repo orders by ascending created_at; reverse so the freshest
+        # entry is on top of the dropdown.
+        return list(reversed(runs))

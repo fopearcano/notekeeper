@@ -194,6 +194,67 @@ STRUCTURED_ENTRY = PromptTemplate(
 )
 
 
+TAGS = PromptTemplate(
+    name="tags",
+    system=(
+        "You extract a small set of relevant lower-case tags from the user's "
+        "notes. Avoid generic tags like 'note', 'audio', or 'transcript'. "
+        "Prefer specific topical tags over broad categories."
+    ),
+    user_template=(
+        "Suggest 3 to 7 tags for the following transcript. The markdown body "
+        "of your response should list them as a single comma-separated line; "
+        "the JSON metadata must put the same tags in the \"tags\" array."
+        "{title_block}{instruction_block}\n\nTranscript:\n{transcript}"
+    ),
+)
+
+
+OUTLINE = PromptTemplate(
+    name="outline",
+    system=(
+        "You produce a hierarchical outline of the user's content. Use "
+        "markdown nested bullet lists; mirror the source's structure "
+        "faithfully without inventing sections."
+    ),
+    user_template=(
+        "Produce a markdown outline of the following transcript. Use nested "
+        "bullets; preserve the source's order and intent."
+        "{title_block}{instruction_block}\n\nTranscript:\n{transcript}"
+    ),
+)
+
+
+KEYPOINTS = PromptTemplate(
+    name="keypoints",
+    system=(
+        "You extract the most important key points from the user's content. "
+        "Be concise — five to ten bullets. Each bullet stands alone."
+    ),
+    user_template=(
+        "Extract the key points from the following transcript as a markdown "
+        "bullet list. Each point should be one sentence and survive on its "
+        "own without surrounding context."
+        "{title_block}{instruction_block}\n\nTranscript:\n{transcript}"
+    ),
+)
+
+
+REWRITE = PromptTemplate(
+    name="rewrite",
+    system=(
+        "You rewrite the user's text in the requested style without changing "
+        "its meaning. Preserve every concrete fact; only adjust voice, tone, "
+        "and rhythm. Pass numbers, names, and quotations through unchanged."
+    ),
+    user_template=(
+        "Rewrite the following transcript according to the user's "
+        "instruction. Preserve all facts; only change the style."
+        "{title_block}{instruction_block}\n\nTranscript:\n{transcript}"
+    ),
+)
+
+
 TEMPLATES: dict[str, PromptTemplate] = {
     t.name: t for t in (
         CLEAN,
@@ -203,6 +264,10 @@ TEMPLATES: dict[str, PromptTemplate] = {
         EXTRACT_TASKS,
         GENERATE_TITLE,
         STRUCTURED_ENTRY,
+        TAGS,
+        OUTLINE,
+        KEYPOINTS,
+        REWRITE,
     )
 }
 

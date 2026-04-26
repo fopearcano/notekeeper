@@ -212,6 +212,62 @@ def test_stream_action_auto_creates_note_when_unsaved(session):
     assert runs[0].task == "summarize"
 
 
+def test_stream_action_with_text_uses_override_not_transcript(session):
+    """The command bar passes ``text=...`` to run an action on a selection
+    instead of the full live transcript."""
+    _push_segments(session, [_seg("FULL TRANSCRIPT TEXT")])
+    saved = session.save_note(title="Note")
+
+    captured_prompts: list[str] = []
+    # ``stream_action`` uses ``stream_complete``; capture from that path.
+    original_stream = session.llm_provider.stream_complete
+
+    async def _spy(*, system, user):
+        captured_prompts.append(user)
+        async for delta in original_stream(system=system, user=user):
+            yield delta
+
+    session.llm_provider.stream_complete = _spy
+    session.note_processor.provider = session.llm_provider
+
+    finals = _drain_stream_with_text(session, "clean", text="just this slice")
+    assert finals
+    # The model saw the override, not the full transcript.
+    assert any("just this slice" in p for p in captured_prompts)
+    assert not any("FULL TRANSCRIPT TEXT" in p for p in captured_prompts)
+
+    # Processing-run row records the override text as the prompt source.
+    runs = session.repository.list_processing_runs(saved.id)
+    assert any("just this slice" in r.prompt for r in runs)
+
+
+def _drain_stream_with_text(session, action, *, text):
+    async def _run():
+        finals = []
+        async for ev in session.stream_action(action, text=text):
+            from app.services.note_processor import StreamFinal
+
+            if isinstance(ev, StreamFinal):
+                finals.append(ev)
+        return finals
+
+    return asyncio.run(_run())
+
+
+def test_processing_runs_returns_newest_first(session):
+    _push_segments(session, [_seg("body")])
+    session.save_note(title="N")
+    _drain_stream(session, "clean")
+    _drain_stream(session, "summarize")
+
+    runs = session.processing_runs()
+    assert [r.task for r in runs] == ["summarize", "clean"]
+
+
+def test_processing_runs_empty_without_current_note(session):
+    assert session.processing_runs() == []
+
+
 def test_stream_action_preserves_title_when_model_returns_empty_title(session):
     """A task that doesn't generate a title (e.g. ``clean`` with empty meta)
     must not blow away the existing title."""

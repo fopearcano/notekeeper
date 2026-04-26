@@ -46,6 +46,14 @@ class NoteEditor(QWidget):
     def text(self) -> str:
         return self._editor.toPlainText()
 
+    def selected_text(self) -> str:
+        """Return whatever the user has selected in the editor, or ``""``."""
+        cursor = self._editor.textCursor()
+        if not cursor.hasSelection():
+            return ""
+        # ``selectedText`` swaps newlines for U+2029; normalise back.
+        return cursor.selectedText().replace(" ", "\n")
+
     def clear(self) -> None:
         self._editor.clear()
         self._meta.clear()
