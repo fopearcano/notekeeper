@@ -14,8 +14,13 @@ window_height = 800
 
 [audio]
 channels = 1
-device = "default"
-vad_aggressiveness = 2
+# Microphone selection. null = system default. Set to a device name string
+# (e.g. "MacBook Pro Microphone") or a numeric index from
+# ``python -c "import sounddevice; print(sounddevice.query_devices())"``.
+# input_device = null
+vad_enabled = true
+# Energy-based VAD threshold (RMS in [0, 1]). 0.01 ≈ quiet room speech.
+vad_threshold = 0.01
 
 [transcription]
 provider = "faster_whisper"

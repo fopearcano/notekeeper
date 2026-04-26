@@ -20,7 +20,8 @@ import threading
 from typing import Callable, Optional
 
 from app.audio.audio_buffer import AudioBuffer
-from app.audio.recorder import AudioRecorder
+from app.audio.recorder import AudioRecorder, RecorderState
+from app.audio.vad import build_default_vad
 from app.config.settings import AppSettings
 from app.llm.factory import create_llm_provider
 from app.llm.prompt_templates import StructuredOutput, render_template
@@ -45,11 +46,13 @@ LevelCallback = Callable[[float], None]
 WarningCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
 NoteSavedCallback = Callable[[Note], None]
+ChunkEventCallback = Callable[[str, float, float], None]
 
 
 class SessionState(enum.Enum):
     IDLE = "idle"
     RECORDING = "recording"
+    PAUSED = "paused"
     STOPPED = "stopped"
 
 
@@ -70,11 +73,15 @@ class SessionManager:
         self.recorder.set_level_callback(self._on_level)
         self.recorder.set_error_callback(self._on_recorder_error)
 
+        self.vad = build_default_vad(settings.audio)
         self.transcription_provider = create_transcription_provider(settings)
-        self.pipeline = TranscriptPipeline(self.transcription_provider, self._buffer)
+        self.pipeline = TranscriptPipeline(
+            self.transcription_provider, self._buffer, vad=self.vad
+        )
         self.pipeline.add_listener(self._on_segment)
         self.pipeline.add_warning_listener(self._on_warning)
         self.pipeline.add_status_listener(self._on_status)
+        self.pipeline.add_chunk_listener(self._on_chunk_event)
 
         self.llm_provider = create_llm_provider(settings)
         self.note_processor = NoteProcessor(self.llm_provider)
@@ -88,6 +95,7 @@ class SessionManager:
         self._warning_listeners: list[WarningCallback] = []
         self._status_listeners: list[StatusCallback] = []
         self._note_saved_listeners: list[NoteSavedCallback] = []
+        self._chunk_event_listeners: list[ChunkEventCallback] = []
 
         # Persistent note pointer. None = nothing saved yet for this run.
         self._current_note_id: Optional[int] = None
@@ -150,6 +158,15 @@ class SessionManager:
         except ValueError:
             pass
 
+    def add_chunk_event_listener(self, listener: ChunkEventCallback) -> None:
+        self._chunk_event_listeners.append(listener)
+
+    def remove_chunk_event_listener(self, listener: ChunkEventCallback) -> None:
+        try:
+            self._chunk_event_listeners.remove(listener)
+        except ValueError:
+            pass
+
     # ----- internal callbacks (run on recorder / pipeline threads) ------
 
     def _on_segment(self, segment: TranscriptSegment) -> None:
@@ -186,6 +203,13 @@ class SessionManager:
     def _on_recorder_error(self, message: str) -> None:
         self._on_warning(message)
 
+    def _on_chunk_event(self, kind: str, timestamp: float, rms: float) -> None:
+        for cb in list(self._chunk_event_listeners):
+            try:
+                cb(kind, timestamp, rms)
+            except Exception:
+                log.exception("Chunk-event listener raised")
+
     def _emit_note_saved(self, note: Note) -> None:
         for cb in list(self._note_saved_listeners):
             try:
@@ -203,6 +227,47 @@ class SessionManager:
     @property
     def transcription_is_stub(self) -> bool:
         return self.transcription_provider.is_stub
+
+    def elapsed_s(self) -> float:
+        """Active recording elapsed seconds (paused intervals excluded)."""
+        return self.recorder.elapsed_s()
+
+    def is_paused(self) -> bool:
+        return self.recorder.is_paused
+
+    # ----- VAD ----------------------------------------------------------
+
+    def set_vad_enabled(self, enabled: bool) -> None:
+        self.vad.set_enabled(enabled)
+
+    def set_vad_threshold(self, threshold: float) -> None:
+        self.vad.set_threshold(threshold)
+
+    @property
+    def vad_enabled(self) -> bool:
+        return self.vad.enabled
+
+    @property
+    def vad_threshold(self) -> float:
+        return self.vad.threshold
+
+    # ----- input device -------------------------------------------------
+
+    def set_input_device(self, device) -> None:
+        """Update the configured input device. Applies on next ``start()``.
+
+        Calling this while recording is a no-op so the live stream keeps
+        running on the device the user originally chose; the new value will
+        be picked up on the next session.
+        """
+        if self.recorder.is_recording:
+            self._on_warning(
+                "Microphone selection cannot be changed while recording — "
+                "stop the session first."
+            )
+            return
+        self.settings.audio.input_device = device
+        self.recorder.settings = self.settings.audio
 
     @property
     def current_note(self) -> Optional[Note]:
@@ -229,7 +294,7 @@ class SessionManager:
     async def start(self) -> None:
         """Begin a fresh recording — drops any in-memory transcript and current note."""
         with self._lock:
-            if self._state == SessionState.RECORDING:
+            if self._state in (SessionState.RECORDING, SessionState.PAUSED):
                 return
             self._segments.clear()
             self._state = SessionState.RECORDING
@@ -240,14 +305,48 @@ class SessionManager:
         self.pipeline.start()
         log.info("Session started")
 
-    async def stop(self) -> None:
+    async def pause(self) -> None:
+        """Stop capturing audio; keep transcript + pipeline alive."""
         with self._lock:
             if self._state != SessionState.RECORDING:
+                return
+            self._state = SessionState.PAUSED
+        self.recorder.pause()
+        log.info("Session paused")
+
+    async def resume(self) -> None:
+        with self._lock:
+            if self._state != SessionState.PAUSED:
+                return
+            self._state = SessionState.RECORDING
+        self.recorder.resume()
+        log.info("Session resumed")
+
+    async def stop(self) -> None:
+        with self._lock:
+            if self._state not in (SessionState.RECORDING, SessionState.PAUSED):
                 return
             self._state = SessionState.STOPPED
         self.recorder.stop()
         await self.pipeline.stop()
         log.info("Session stopped")
+
+    async def clear_session(self) -> None:
+        """Reset the live state: stop if active, drop transcript + current note.
+
+        The persisted note (if any) stays on disk — only the in-memory state
+        and the *current note pointer* are cleared. The next save creates a
+        fresh note.
+        """
+        if self._state in (SessionState.RECORDING, SessionState.PAUSED):
+            await self.stop()
+        with self._lock:
+            self._segments.clear()
+            self._state = SessionState.IDLE
+        self._current_note_id = None
+        self._current_note = None
+        self._segments_persisted = 0
+        log.info("Session cleared")
 
     async def aclose(self) -> None:
         await self.note_processor.aclose()

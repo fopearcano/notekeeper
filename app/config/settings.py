@@ -16,7 +16,7 @@ import os
 import shutil
 import tomllib
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -52,11 +52,23 @@ class UISettings(BaseModel):
 
 
 class AudioSettings(BaseModel):
-    """Capture-side audio settings (sample rate lives on the transcription section)."""
+    """Capture-side audio settings (sample rate lives on the transcription section).
+
+    ``input_device`` may be ``None`` (system default), a device name string,
+    or a numeric index. ``sounddevice.query_devices()`` accepts any of those.
+
+    The energy-based VAD has only two knobs:
+
+    * ``vad_enabled`` — when ``False`` every chunk is sent to transcription.
+    * ``vad_threshold`` — RMS in [0, 1]; chunks below this are skipped at
+      transcription time but still advance the timeline so timestamps stay
+      anchored to wall-clock recording time.
+    """
 
     channels: int = Field(default=1, ge=1, le=2)
-    device: str = "default"
-    vad_aggressiveness: int = Field(default=2, ge=0, le=3)
+    input_device: Optional[Any] = None  # None | str | int
+    vad_enabled: bool = True
+    vad_threshold: float = Field(default=0.01, ge=0.0, le=1.0)
 
 
 class StorageSettings(BaseModel):

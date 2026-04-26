@@ -24,6 +24,9 @@ from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -34,6 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.audio.recorder import list_input_devices
 from app.config.settings import AppSettings
 from app.llm.prompt_templates import UI_TASKS
 from app.notes.models import Note, NoteSummary
@@ -45,6 +49,9 @@ from app.utils.logging import get_logger
 
 #: Autosave cadence while recording (milliseconds).
 AUTOSAVE_INTERVAL_MS = 30_000
+
+#: Elapsed-time refresh cadence (milliseconds).
+ELAPSED_TICK_MS = 500
 
 log = get_logger(__name__)
 
@@ -112,6 +119,8 @@ class MainWindow(QMainWindow):
     _note_saved = Signal(object)  # Note
     _note_loaded = Signal(object)  # Note
     _notes_listed = Signal(list)  # list[NoteSummary]
+    # Live-capture chunk events (pipeline → UI).
+    _chunk_event = Signal(str, float, float)  # kind, timestamp, rms
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         super().__init__()
@@ -173,6 +182,11 @@ class MainWindow(QMainWindow):
         self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
         self._autosave_timer.timeout.connect(self._on_autosave_tick)
 
+        # ----- elapsed-time tick ------------------------------------------
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(ELAPSED_TICK_MS)
+        self._elapsed_timer.timeout.connect(self._on_elapsed_tick)
+
         # ----- cross-thread signal wiring ---------------------------------
         self._segment_received.connect(self.transcript_view.append_segment)
         self._state_changed.connect(self.status.set_state)
@@ -187,6 +201,7 @@ class MainWindow(QMainWindow):
         self._note_saved.connect(self._on_note_saved)
         self._note_loaded.connect(self._on_note_loaded)
         self._notes_listed.connect(self._refresh_sidebar)
+        self._chunk_event.connect(self._on_chunk_event)
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -206,11 +221,42 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
 
         self.act_start = QAction("Start Recording", self)
+        self.act_pause = QAction("Pause", self)
         self.act_stop = QAction("Stop Recording", self)
+        self.act_clear = QAction("Clear", self)
         self.act_save = QAction("Save Note", self)
+        self.act_pause.setEnabled(False)
         self.act_stop.setEnabled(False)
-        for act in (self.act_start, self.act_stop, self.act_save):
+        for act in (
+            self.act_start,
+            self.act_pause,
+            self.act_stop,
+            self.act_clear,
+            self.act_save,
+        ):
             tb.addAction(act)
+
+        tb.addSeparator()
+
+        # Mic selector — populated lazily so we don't hit PortAudio in
+        # construction tests. "System default" is row 0 with userData=None.
+        tb.addWidget(QLabel(" Mic: "))
+        self.mic_combo = QComboBox(self)
+        self.mic_combo.setMinimumContentsLength(20)
+        self.mic_combo.addItem("System default", userData=None)
+        self.mic_combo.currentIndexChanged.connect(self._on_mic_changed)
+        tb.addWidget(self.mic_combo)
+
+        # VAD toggle next to the mic combo.
+        self.vad_checkbox = QCheckBox("VAD", self)
+        self.vad_checkbox.setToolTip(
+            "Voice Activity Detection — skips silent audio chunks before "
+            "transcription. Threshold lives in [audio].vad_threshold."
+        )
+        self.vad_checkbox.setChecked(self.settings.audio.vad_enabled)
+        self.vad_checkbox.toggled.connect(self._on_vad_toggled)
+        tb.addWidget(self.vad_checkbox)
+
         tb.addSeparator()
 
         self._task_actions: dict[str, QAction] = {}
@@ -222,7 +268,9 @@ class MainWindow(QMainWindow):
             self._task_actions[task] = action
 
         self.act_start.triggered.connect(self._on_start)
+        self.act_pause.triggered.connect(self._on_pause_resume)
         self.act_stop.triggered.connect(self._on_stop)
+        self.act_clear.triggered.connect(self._on_clear)
         self.act_save.triggered.connect(self._on_save)
 
     def _build_menu_bar(self) -> None:
@@ -252,12 +300,16 @@ class MainWindow(QMainWindow):
         self._session.add_note_saved_listener(
             lambda note: self._note_saved.emit(note)
         )
+        self._session.add_chunk_event_listener(
+            lambda kind, ts, rms: self._chunk_event.emit(kind, ts, rms)
+        )
         self.status.set_providers(
             self._session.transcription_provider.provider_key,
             self._session.llm_provider.provider_key,
         )
         self._state_changed.emit("Idle")
         self.status.set_message("Session manager ready")
+        self._populate_mic_combo()
         self._reload_notes_async()
 
     # ----- toolbar handlers ------------------------------------------------
@@ -277,7 +329,11 @@ class MainWindow(QMainWindow):
         self.note_editor.clear()
         self.act_start.setEnabled(False)
         self.act_stop.setEnabled(True)
+        self.act_pause.setEnabled(True)
+        self.act_pause.setText("Pause")
+        self.mic_combo.setEnabled(False)
         self._state_changed.emit("Recording")
+        self.status.set_elapsed(0.0)
         if session.transcription_is_stub:
             self.status.set_message(
                 f"Recording started — transcription provider "
@@ -289,6 +345,31 @@ class MainWindow(QMainWindow):
             self.status.set_message("Recording started")
         self._submit(session.start(), "Failed to start recording")
         self._autosave_timer.start()
+        self._elapsed_timer.start()
+
+    @Slot()
+    def _on_pause_resume(self) -> None:
+        session = self._require_session()
+        if session is None:
+            return
+        if session.is_paused():
+            async def _resume() -> None:
+                await session.resume()
+
+            self._submit(_resume(), "Failed to resume recording")
+            self.act_pause.setText("Pause")
+            self._state_changed.emit("Recording")
+            self.status.set_message("Recording resumed")
+            self._autosave_timer.start()
+        else:
+            async def _pause() -> None:
+                await session.pause()
+
+            self._submit(_pause(), "Failed to pause recording")
+            self.act_pause.setText("Resume")
+            self._state_changed.emit("Paused")
+            self.status.set_message("Recording paused")
+            self._autosave_timer.stop()
 
     @Slot()
     def _on_stop(self) -> None:
@@ -296,7 +377,9 @@ class MainWindow(QMainWindow):
         if session is None:
             return
         self.act_stop.setEnabled(False)
+        self.act_pause.setEnabled(False)
         self._autosave_timer.stop()
+        self._elapsed_timer.stop()
 
         async def _do_stop() -> None:
             await session.stop()
@@ -307,8 +390,42 @@ class MainWindow(QMainWindow):
 
     def _after_stop(self) -> None:
         self.act_start.setEnabled(True)
+        self.act_pause.setEnabled(False)
+        self.act_pause.setText("Pause")
+        self.mic_combo.setEnabled(True)
         self._state_changed.emit("Stopped")
         self.status.set_message("Recording stopped")
+        self.transcript_view.set_pending(False)
+
+    @Slot()
+    def _on_clear(self) -> None:
+        session = self._require_session()
+        if session is None:
+            return
+        self._autosave_timer.stop()
+        self._elapsed_timer.stop()
+
+        async def _do_clear() -> None:
+            await session.clear_session()
+
+        future = self._submit(_do_clear(), "Failed to clear session")
+        if future is None:
+            return
+
+        def _done(_fut) -> None:
+            self.transcript_view.clear()
+            self.note_editor.clear()
+            self.status.set_elapsed(0.0)
+            self.status.set_level(0.0)
+            self.act_start.setEnabled(True)
+            self.act_pause.setEnabled(False)
+            self.act_pause.setText("Pause")
+            self.act_stop.setEnabled(False)
+            self.mic_combo.setEnabled(True)
+            self._state_changed.emit("Idle")
+            self.status.set_message("Session cleared")
+
+        future.add_done_callback(_done)
 
     @Slot()
     def _on_save(self) -> None:
@@ -355,6 +472,77 @@ class MainWindow(QMainWindow):
         return first_line[:60] if first_line else "Untitled note"
 
     # ----- autosave -----------------------------------------------------
+
+    @Slot()
+    def _on_elapsed_tick(self) -> None:
+        session = self._session
+        if session is None:
+            return
+        self.status.set_elapsed(session.elapsed_s())
+
+    # ----- mic + VAD -----------------------------------------------------
+
+    def _populate_mic_combo(self) -> None:
+        """Populate the mic combo from sounddevice; preselect the configured device."""
+        # Block signals so populating doesn't fire ``_on_mic_changed``.
+        self.mic_combo.blockSignals(True)
+        try:
+            self.mic_combo.clear()
+            self.mic_combo.addItem("System default", userData=None)
+            for dev in list_input_devices():
+                label = dev["name"]
+                if dev.get("default"):
+                    label += "  (system default)"
+                self.mic_combo.addItem(label, userData=dev["index"])
+
+            # Preselect from settings.
+            current = self.settings.audio.input_device
+            for i in range(self.mic_combo.count()):
+                value = self.mic_combo.itemData(i)
+                if (
+                    value == current
+                    or (isinstance(current, str) and isinstance(value, int)
+                        and current == self.mic_combo.itemText(i))
+                ):
+                    self.mic_combo.setCurrentIndex(i)
+                    break
+        finally:
+            self.mic_combo.blockSignals(False)
+
+    @Slot(int)
+    def _on_mic_changed(self, _index: int) -> None:
+        session = self._session
+        if session is None:
+            return
+        device = self.mic_combo.currentData()
+        session.set_input_device(device)
+        label = self.mic_combo.currentText()
+        self.status.set_message(f"Microphone: {label}", timeout_ms=3000)
+
+    @Slot(bool)
+    def _on_vad_toggled(self, enabled: bool) -> None:
+        session = self._session
+        if session is None:
+            return
+        session.set_vad_enabled(enabled)
+        self.status.set_message(
+            f"VAD {'enabled' if enabled else 'disabled'} "
+            f"(threshold {session.vad_threshold:.3f})",
+            timeout_ms=3000,
+        )
+
+    # ----- chunk-event indicator ----------------------------------------
+
+    @Slot(str, float, float)
+    def _on_chunk_event(self, kind: str, timestamp: float, _rms: float) -> None:
+        if kind == "received":
+            self.transcript_view.set_pending(True, timestamp)
+        elif kind == "transcribed":
+            self.transcript_view.set_pending(False)
+        elif kind == "skipped":
+            self.transcript_view.mark_skipped(timestamp)
+            # Auto-clear after a brief moment so the placeholder doesn't linger.
+            QTimer.singleShot(800, lambda: self.transcript_view.set_pending(False))
 
     @Slot()
     def _on_autosave_tick(self) -> None:
