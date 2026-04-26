@@ -6,8 +6,9 @@ summarization, organization, and formatting.
 
 This repository currently contains the **initial scaffold**: the GUI shell,
 clean interfaces for audio / transcription / LLM providers, and placeholder
-services. No real audio is captured yet — hitting *Start Recording* drives a
-fake transcript through the same pipeline that the live providers will use.
+services. Real microphone capture, faster-whisper transcription, and an
+OpenAI-compatible cloud audio provider are wired up; LM Studio is supported
+for the LLM stage.
 
 ## Stack
 
@@ -81,11 +82,27 @@ asr = create_transcription_provider(settings)   # → FasterWhisperProvider, etc
 llm = create_llm_provider(settings)             # → LMStudioProvider, etc.
 ```
 
-> **Note:** `lmstudio_audio` is a deliberate stub. LM Studio does not expose a
-> real-time audio transcription endpoint today; the stub stays in place until
-> a compatible endpoint is explicitly available. Use `faster_whisper` or
-> `openai_audio` for transcription. LM Studio is fully wired up for **LLM**
-> processing via its OpenAI-compatible `/chat/completions` endpoint.
+### Recommended provider setup
+
+| Stage                 | Recommended       | Why                                                              |
+| --------------------- | ----------------- | ---------------------------------------------------------------- |
+| Speech-to-text        | **faster-whisper** | Fully local, GPU-accelerated, no roundtrip latency.              |
+| LLM cleanup / summary | **LM Studio**     | Local OpenAI-compatible chat/completions, no API costs.          |
+
+The `openai_audio` provider is available for users who want a cloud
+transcription service or are pointing at a self-hosted server that exposes
+the OpenAI `/audio/transcriptions` shape. It posts each chunk as a small
+in-memory WAV file and reads `text` from the JSON response. A 404 produces
+a clear *"this endpoint does not support audio transcription"* warning so
+misconfigurations surface immediately instead of looping silently.
+
+> **Note on LM Studio audio.** LM Studio does not currently expose a
+> real-time audio transcription endpoint. The `lmstudio_audio` provider is
+> kept as a disabled experimental stub (`[lmstudio_audio].enabled = false`
+> by default) — flipping it on without a compatible backend will warn and
+> drop chunks rather than crash. Use `faster_whisper` for local STT and
+> `openai_audio` for cloud STT; LM Studio remains fully wired up for the
+> **LLM** stage via its OpenAI-compatible `/chat/completions` endpoint.
 
 ## Tests
 
@@ -94,5 +111,6 @@ pytest
 ```
 
 The smoke tests verify that all packages import, the config loads, the SQLite
-repository round-trips a note, and the transcript pipeline forwards segments
-from a stub provider.
+repository round-trips a note, the audio pipeline chunks correctly, the
+faster-whisper provider lazy-loads with CPU fallback, and the OpenAI audio
+provider handles 404 / auth / timeout cases without crashing.
