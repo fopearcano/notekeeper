@@ -1,35 +1,63 @@
+"""Pipeline status/warning forwarding tests."""
+
+from __future__ import annotations
+
 import asyncio
+from typing import AsyncIterator
 
-from app.config.settings import load_settings
+from app.audio.audio_buffer import AudioChunk
 from app.services.transcript_pipeline import TranscriptPipeline
-from app.transcription.factory import create_transcription_provider
+from app.transcription.base import TranscriptionProvider, TranscriptSegment
 
 
-def test_stub_provider_emits_segments():
-    """The stub provider should drive segments through the pipeline to listeners."""
-    settings = load_settings(
-        bootstrap=False,
-        overrides={
-            "transcription": {"provider": "faster_whisper", "chunk_seconds": 1},
-        },
-    )
-    provider = create_transcription_provider(settings)
-    pipeline = TranscriptPipeline(provider)
+class _ChattyProvider(TranscriptionProvider):
+    """Provider that exercises both side channels during stream()."""
 
-    captured: list[str] = []
-    pipeline.add_listener(lambda segment: captured.append(segment.text))
+    provider_key = "chatty"
+    is_stub = False
 
-    async def _drive() -> None:
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+
+    async def stream(
+        self, chunks: AsyncIterator[AudioChunk]
+    ) -> AsyncIterator[TranscriptSegment]:
+        self._emit_status("Loading…")
+        async for chunk in chunks:
+            self._emit_status(f"latency: {chunk.timestamp:.1f} ms")
+            if chunk.timestamp < 0:
+                self._emit_warning("silly chunk")
+                continue
+            yield TranscriptSegment(text=f"hi@{chunk.timestamp:.1f}", is_final=True)
+
+
+def test_pipeline_forwards_provider_status_and_warnings():
+    pipeline = TranscriptPipeline(_ChattyProvider())
+
+    statuses: list[str] = []
+    warnings: list[str] = []
+    segments: list[TranscriptSegment] = []
+    pipeline.add_status_listener(statuses.append)
+    pipeline.add_warning_listener(warnings.append)
+    pipeline.add_listener(segments.append)
+
+    async def _run():
         task = pipeline.start()
-        # Let the scripted phrases flow through.
-        await asyncio.sleep(1.5)
+        # Push a normal chunk and a "silly" one to exercise both channels.
+        pipeline.buffer.push(
+            AudioChunk(data=b"\x00" * 4, sample_rate=16000, channels=1, timestamp=0.5)
+        )
+        pipeline.buffer.push(
+            AudioChunk(data=b"\x00" * 4, sample_rate=16000, channels=1, timestamp=-1.0)
+        )
+        await asyncio.sleep(0.3)
         await pipeline.stop()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        if not task.done():
+            task.cancel()
 
-    asyncio.run(_drive())
+    asyncio.run(_run())
 
-    assert captured, "Pipeline should have produced at least one segment"
-    assert all(isinstance(s, str) and s for s in captured)
+    assert any("loading" in s.lower() for s in statuses)
+    assert any("latency" in s.lower() for s in statuses)
+    assert any("silly" in w.lower() for w in warnings)
+    assert any(seg.text.startswith("hi@") for seg in segments)

@@ -33,6 +33,7 @@ log = get_logger(__name__)
 
 SegmentListener = Callable[[TranscriptSegment], Awaitable[None] | None]
 WarningListener = Callable[[str], None]
+StatusListener = Callable[[str], None]
 
 
 class TranscriptPipeline:
@@ -46,11 +47,17 @@ class TranscriptPipeline:
         self.buffer = buffer if buffer is not None else AudioBuffer()
         self._listeners: list[SegmentListener] = []
         self._warning_listeners: list[WarningListener] = []
+        self._status_listeners: list[StatusListener] = []
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
 
         self._started_at: Optional[float] = None
         self._last_chunk_offset: float = 0.0
+
+        # Wire the provider's side channels through the pipeline's listeners
+        # so callers only need to subscribe in one place.
+        provider.set_warning_callback(self._emit_warning)
+        provider.set_status_callback(self._emit_status)
 
     # ----- subscription --------------------------------------------------
 
@@ -71,6 +78,23 @@ class TranscriptPipeline:
             self._warning_listeners.remove(listener)
         except ValueError:
             pass
+
+    def add_status_listener(self, listener: StatusListener) -> None:
+        self._status_listeners.append(listener)
+
+    def remove_status_listener(self, listener: StatusListener) -> None:
+        try:
+            self._status_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def _emit_status(self, message: str) -> None:
+        log.debug("status: %s", message)
+        for listener in list(self._status_listeners):
+            try:
+                listener(message)
+            except Exception:
+                log.exception("Status listener raised")
 
     def _emit_warning(self, message: str) -> None:
         log.warning(message)

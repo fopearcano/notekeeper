@@ -27,6 +27,7 @@ log = get_logger(__name__)
 SegmentCallback = Callable[[TranscriptSegment], None]
 LevelCallback = Callable[[float], None]
 WarningCallback = Callable[[str], None]
+StatusCallback = Callable[[str], None]
 
 
 class SessionState(enum.Enum):
@@ -60,6 +61,7 @@ class SessionManager:
         self.pipeline = TranscriptPipeline(self.transcription_provider, self._buffer)
         self.pipeline.add_listener(self._on_segment)
         self.pipeline.add_warning_listener(self._on_warning)
+        self.pipeline.add_status_listener(self._on_status)
 
         self.llm_provider = create_llm_provider(settings)
         self.note_processor = NoteProcessor(self.llm_provider)
@@ -71,6 +73,7 @@ class SessionManager:
         self._segment_listeners: list[SegmentCallback] = []
         self._level_listeners: list[LevelCallback] = []
         self._warning_listeners: list[WarningCallback] = []
+        self._status_listeners: list[StatusCallback] = []
 
         log.info(
             "SessionManager ready (transcription=%s [stub=%s], llm=%s)",
@@ -108,6 +111,15 @@ class SessionManager:
         except ValueError:
             pass
 
+    def add_status_listener(self, listener: StatusCallback) -> None:
+        self._status_listeners.append(listener)
+
+    def remove_status_listener(self, listener: StatusCallback) -> None:
+        try:
+            self._status_listeners.remove(listener)
+        except ValueError:
+            pass
+
     # ----- internal callbacks (run on recorder / pipeline threads) ------
 
     def _on_segment(self, segment: TranscriptSegment) -> None:
@@ -133,6 +145,13 @@ class SessionManager:
                 cb(message)
             except Exception:
                 log.exception("Warning listener raised")
+
+    def _on_status(self, message: str) -> None:
+        for cb in list(self._status_listeners):
+            try:
+                cb(message)
+            except Exception:
+                log.exception("Status listener raised")
 
     def _on_recorder_error(self, message: str) -> None:
         # Recorder failures are surfaced through the same warning channel.

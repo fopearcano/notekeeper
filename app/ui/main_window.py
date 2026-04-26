@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
     _error_raised = Signal(str)
     _level_received = Signal(float)
     _warning_received = Signal(str)
+    _status_received = Signal(str)
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         super().__init__()
@@ -160,6 +161,7 @@ class MainWindow(QMainWindow):
         self._error_raised.connect(self._show_error)
         self._level_received.connect(self.status.set_level)
         self._warning_received.connect(self._on_warning)
+        self._status_received.connect(self._on_status)
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -207,6 +209,9 @@ class MainWindow(QMainWindow):
         )
         self._session.add_warning_listener(
             lambda message: self._warning_received.emit(message)
+        )
+        self._session.add_status_listener(
+            lambda message: self._status_received.emit(message)
         )
         self.status.set_providers(
             self._session.transcription_provider.provider_key,
@@ -329,6 +334,11 @@ class MainWindow(QMainWindow):
         """Non-modal warning surface — shown in the status bar instead of a dialog."""
         log.warning(message)
         self.status.set_message(message, timeout_ms=8000)
+
+    @Slot(str)
+    def _on_status(self, message: str) -> None:
+        """Transient status update (model loading, latency, …)."""
+        self.status.set_message(message, timeout_ms=3000)
 
     # ----- close ----------------------------------------------------------
 

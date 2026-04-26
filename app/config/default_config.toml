@@ -27,6 +27,7 @@ sample_rate = 16000
 model = "small"
 device = "cuda"
 compute_type = "float16"
+allow_cpu_fallback = true
 
 [openai_audio]
 base_url = "https://api.openai.com/v1"

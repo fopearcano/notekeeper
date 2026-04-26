@@ -83,6 +83,7 @@ class FasterWhisperSettings(BaseModel):
     model: str = "small"
     device: str = "cuda"  # "cuda", "cpu", "auto"
     compute_type: str = "float16"  # "int8", "int8_float16", "float16", "float32"
+    allow_cpu_fallback: bool = True
 
 
 class _APIKeyFromEnvMixin(BaseModel):
