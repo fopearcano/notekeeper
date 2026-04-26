@@ -81,6 +81,8 @@ UNDERSTAND = PromptTemplate(
 TEMPLATES: dict[str, PromptTemplate] = {
     t.name: t for t in (SUMMARIZE, ORGANIZE, FORMAT, CLEANUP, UNDERSTAND)
 }
+# Aliases — ``llm.default_task = "clean"`` from default_config.toml maps here.
+TEMPLATES["clean"] = CLEANUP
 
 
 def render_template(name: str, transcript: str) -> tuple[str, str]:

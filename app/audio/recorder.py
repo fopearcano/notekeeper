@@ -33,8 +33,14 @@ class AudioRecorder:
     whatever stub the transcription pipeline is using.
     """
 
-    def __init__(self, settings: AudioSettings, buffer: Optional[AudioBuffer] = None):
+    def __init__(
+        self,
+        settings: AudioSettings,
+        sample_rate: int,
+        buffer: Optional[AudioBuffer] = None,
+    ):
         self.settings = settings
+        self.sample_rate = sample_rate
         self.buffer = buffer or AudioBuffer()
         self._state = RecorderState.IDLE
         self._lock = threading.Lock()
@@ -56,7 +62,7 @@ class AudioRecorder:
         # TODO: open sounddevice.RawInputStream and push chunks into self.buffer
         log.info(
             "AudioRecorder started (sample_rate=%d, channels=%d, device=%s)",
-            self.settings.sample_rate,
+            self.sample_rate,
             self.settings.channels,
             self.settings.device,
         )

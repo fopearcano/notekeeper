@@ -1,14 +1,19 @@
 import asyncio
 
-from app.config.settings import TranscriptionSettings
+from app.config.settings import load_settings
 from app.services.transcript_pipeline import TranscriptPipeline
-from app.transcription.faster_whisper_provider import FasterWhisperProvider
+from app.transcription.factory import create_transcription_provider
 
 
 def test_stub_provider_emits_segments():
     """The stub provider should drive segments through the pipeline to listeners."""
-    settings = TranscriptionSettings(provider="faster_whisper", emit_interval_ms=50)
-    provider = FasterWhisperProvider(settings)
+    settings = load_settings(
+        bootstrap=False,
+        overrides={
+            "transcription": {"provider": "faster_whisper", "chunk_seconds": 1},
+        },
+    )
+    provider = create_transcription_provider(settings)
     pipeline = TranscriptPipeline(provider)
 
     captured: list[str] = []
@@ -17,7 +22,7 @@ def test_stub_provider_emits_segments():
     async def _drive() -> None:
         task = pipeline.start()
         # Let the scripted phrases flow through.
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(1.5)
         await pipeline.stop()
         try:
             await task

@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import AsyncIterator
 
 from app.audio.audio_buffer import AudioChunk
+from app.config.settings import OpenAIAudioSettings, TranscriptionSettings
 from app.transcription.base import TranscriptionProvider, TranscriptSegment
 from app.utils.logging import get_logger
 
@@ -18,9 +19,23 @@ log = get_logger(__name__)
 
 
 class OpenAIAudioProvider(TranscriptionProvider):
+    provider_key = "openai_audio"
+
+    def __init__(
+        self,
+        transcription: TranscriptionSettings,
+        openai_audio: OpenAIAudioSettings,
+    ):
+        self.transcription = transcription
+        self.openai_audio = openai_audio
+
     async def start(self) -> None:
-        log.info("OpenAIAudioProvider.start (model=%s)", self.settings.model)
-        # TODO: build httpx.AsyncClient with the configured api_key.
+        log.info(
+            "OpenAIAudioProvider.start (model=%s, base_url=%s)",
+            self.openai_audio.model,
+            self.openai_audio.base_url,
+        )
+        # TODO: build httpx.AsyncClient with the resolved api key.
 
     async def stop(self) -> None:
         log.info("OpenAIAudioProvider.stop")
@@ -30,7 +45,6 @@ class OpenAIAudioProvider(TranscriptionProvider):
     ) -> AsyncIterator[TranscriptSegment]:
         raise NotImplementedError(
             "OpenAI audio transcription is not implemented yet. "
-            "Switch transcription.provider to 'faster_whisper' or 'lmstudio_stub'."
+            "Switch transcription.provider to 'faster_whisper' until then."
         )
-        # Make this an async generator at the type level.
         yield  # type: ignore[unreachable]

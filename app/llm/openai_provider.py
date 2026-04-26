@@ -6,6 +6,7 @@ from typing import Optional
 
 import httpx
 
+from app.config.settings import OpenAILLMSettings
 from app.llm.base import LLMProvider, LLMResponse
 from app.utils.logging import get_logger
 
@@ -13,22 +14,25 @@ log = get_logger(__name__)
 
 
 class OpenAIProvider(LLMProvider):
-    def __init__(self, settings):
-        super().__init__(settings)
+    provider_key = "openai"
+
+    def __init__(self, settings: OpenAILLMSettings):
+        self.settings = settings
         self._client: Optional[httpx.AsyncClient] = None
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            if not self.settings.api_key:
+            api_key = self.settings.resolve_api_key()
+            if not api_key:
                 raise RuntimeError(
-                    "OpenAI provider requires an API key (set OPENAI_API_KEY or "
-                    "configure llm.api_key in your config file)."
+                    f"OpenAI provider requires an API key — set the "
+                    f"${self.settings.api_key_env} environment variable."
                 )
             self._client = httpx.AsyncClient(
-                base_url=self.settings.base_url or "https://api.openai.com/v1",
-                timeout=self.settings.request_timeout_s,
+                base_url=self.settings.base_url,
+                timeout=self.settings.timeout_seconds,
                 headers={
-                    "Authorization": f"Bearer {self.settings.api_key}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
             )
@@ -49,8 +53,11 @@ class OpenAIProvider(LLMProvider):
         resp.raise_for_status()
         data = resp.json()
         text = data["choices"][0]["message"]["content"]
-        return LLMResponse(text=text, model=data.get("model", self.settings.model),
-                           usage=data.get("usage"))
+        return LLMResponse(
+            text=text,
+            model=data.get("model", self.settings.model),
+            usage=data.get("usage"),
+        )
 
     async def aclose(self) -> None:
         if self._client is not None:

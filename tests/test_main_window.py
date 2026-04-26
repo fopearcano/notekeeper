@@ -26,7 +26,7 @@ def qapp():
 
 
 def test_main_window_constructs(qapp):
-    settings = load_settings()
+    settings = load_settings(bootstrap=False)
     db = Database(":memory:")
     try:
         repo = NoteRepository(db)
@@ -37,6 +37,10 @@ def test_main_window_constructs(qapp):
             assert not window.act_stop.isEnabled()
             assert window.transcript_view is not None
             assert window.note_editor is not None
+            # The status bar shows the configured providers immediately.
+            providers_label = window.status._providers.text()
+            assert settings.transcription.provider in providers_label
+            assert settings.llm.provider in providers_label
         finally:
             window.shutdown()
             window.close()

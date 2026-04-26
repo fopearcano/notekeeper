@@ -54,10 +54,38 @@ The UI opens with:
 
 ## Configuration
 
-`app/config/default_config.toml` ships sensible defaults. A user-level config
-is loaded from `~/.config/notekeeper/config.toml` when present and merged on
-top of the defaults. Environment variables (`OPENAI_API_KEY`,
-`ANTHROPIC_API_KEY`) override the values from disk.
+`app/config/default_config.toml` ships sensible defaults. On first launch,
+they are copied to `~/.notekeeper/config.toml` — edit that file to customise
+providers and models. The bundled defaults are merged in as a base layer so
+older user files keep validating after upgrades that add new keys.
+
+API keys live in environment variables. Each provider section names the
+variable in `api_key_env`:
+
+- `[openai_audio]` and `[openai]` → `OPENAI_API_KEY`
+- `[anthropic]` → `ANTHROPIC_API_KEY`
+- `[lmstudio]` → uses an inline `api_key` (LM Studio accepts a placeholder string)
+
+Active transcription and LLM providers are shown in the right side of the
+status bar (`ASR: faster_whisper | LLM: lmstudio`).
+
+### Provider factories
+
+```python
+from app.config.settings import load_settings
+from app.transcription.factory import create_transcription_provider
+from app.llm.factory import create_llm_provider
+
+settings = load_settings()
+asr = create_transcription_provider(settings)   # → FasterWhisperProvider, etc.
+llm = create_llm_provider(settings)             # → LMStudioProvider, etc.
+```
+
+> **Note:** `lmstudio_audio` is a deliberate stub. LM Studio does not expose a
+> real-time audio transcription endpoint today; the stub stays in place until
+> a compatible endpoint is explicitly available. Use `faster_whisper` or
+> `openai_audio` for transcription. LM Studio is fully wired up for **LLM**
+> processing via its OpenAI-compatible `/chat/completions` endpoint.
 
 ## Tests
 

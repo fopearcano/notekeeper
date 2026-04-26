@@ -7,19 +7,19 @@ thread so the UI never blocks.
 
 from __future__ import annotations
 
-import asyncio
 import enum
 import threading
-from typing import Awaitable, Callable, Optional
+from typing import Callable
 
 from app.audio.audio_buffer import AudioBuffer
 from app.audio.recorder import AudioRecorder
 from app.config.settings import AppSettings
+from app.llm.factory import create_llm_provider
 from app.notes.repository import NoteRepository
 from app.services.note_processor import NoteProcessor
 from app.services.transcript_pipeline import TranscriptPipeline
-from app.transcription.base import TranscriptSegment, build_provider as build_transcription
-from app.llm.base import build_provider as build_llm
+from app.transcription.base import TranscriptSegment
+from app.transcription.factory import create_transcription_provider
 from app.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -45,18 +45,29 @@ class SessionManager:
         self.repository = repository
 
         self._buffer = AudioBuffer()
-        self.recorder = AudioRecorder(settings.audio, self._buffer)
+        self.recorder = AudioRecorder(
+            settings.audio,
+            sample_rate=settings.transcription.sample_rate,
+            buffer=self._buffer,
+        )
 
-        transcription_provider = build_transcription(settings.transcription)
-        self.pipeline = TranscriptPipeline(transcription_provider, self._buffer)
+        self.transcription_provider = create_transcription_provider(settings)
+        self.pipeline = TranscriptPipeline(self.transcription_provider, self._buffer)
         self.pipeline.add_listener(self._on_segment)
 
-        self.note_processor = NoteProcessor(build_llm(settings.llm))
+        self.llm_provider = create_llm_provider(settings)
+        self.note_processor = NoteProcessor(self.llm_provider)
 
         self._state = SessionState.IDLE
         self._lock = threading.Lock()
         self._segments: list[TranscriptSegment] = []
         self._segment_listeners: list[SegmentCallback] = []
+
+        log.info(
+            "SessionManager ready (transcription=%s, llm=%s)",
+            self.transcription_provider.provider_key,
+            self.llm_provider.provider_key,
+        )
 
     # ----- subscription --------------------------------------------------
 
@@ -120,7 +131,9 @@ class SessionManager:
 
     # ----- LLM convenience ----------------------------------------------
 
-    async def run_action(self, action: str) -> str:
+    async def run_action(self, action: str | None = None) -> str:
+        """Process the current transcript with ``action`` (default: configured task)."""
+        action = action or self.settings.llm.default_task
         transcript = self.transcript_text()
         result = await self.note_processor.process(action=action, transcript=transcript)
         return result.text

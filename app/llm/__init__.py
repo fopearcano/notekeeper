@@ -1,13 +1,14 @@
 """LLM provider package."""
 
-from app.llm.base import LLMProvider, LLMResponse, build_provider
-from app.llm.prompt_templates import PromptTemplate, render_template, TEMPLATES
+from app.llm.base import LLMProvider, LLMResponse
+from app.llm.factory import create_llm_provider
+from app.llm.prompt_templates import TEMPLATES, PromptTemplate, render_template
 
 __all__ = [
     "LLMProvider",
     "LLMResponse",
     "PromptTemplate",
     "TEMPLATES",
-    "build_provider",
+    "create_llm_provider",
     "render_template",
 ]

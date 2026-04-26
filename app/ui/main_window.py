@@ -133,6 +133,9 @@ class MainWindow(QMainWindow):
         # ----- status bar --------------------------------------------------
         self.status = NotekeeperStatusBar(self)
         self.setStatusBar(self.status)
+        # Show configured providers immediately; refreshed once the session manager
+        # is up in case the provider keys ever differ from the bare config.
+        self.status.set_providers(settings.transcription.provider, settings.llm.provider)
 
         # ----- toolbar -----------------------------------------------------
         self._build_toolbar()
@@ -193,6 +196,10 @@ class MainWindow(QMainWindow):
         self._session = SessionManager(self.settings, self.repository)
         self._session.add_segment_listener(
             lambda seg: self._segment_received.emit(seg)
+        )
+        self.status.set_providers(
+            self._session.transcription_provider.provider_key,
+            self._session.llm_provider.provider_key,
         )
         self._state_changed.emit("Idle")
         self.status.set_message("Session manager ready")
