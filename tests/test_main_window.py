@@ -32,7 +32,8 @@ def test_main_window_constructs(qapp):
         repo = NoteRepository(db)
         window = MainWindow(settings, repo)
         try:
-            assert window.windowTitle() == settings.ui.window_title
+            # Title includes the version (e.g. "Notekeeper v0.1.0").
+            assert settings.ui.window_title in window.windowTitle()
             assert window.act_start.isEnabled()
             assert not window.act_stop.isEnabled()
             assert window.transcript_view is not None

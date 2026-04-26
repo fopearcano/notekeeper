@@ -1,0 +1,102 @@
+# Notekeeper user configuration — example.
+#
+# Copy to ~/.notekeeper/config.toml (the file Notekeeper reads on launch)
+# or just edit the one auto-created on first run. Sections you don't
+# touch fall through to the bundled defaults in
+# ``app/config/default_config.toml`` so this file can stay short.
+
+[app]
+log_level = "INFO"
+
+[ui]
+window_title = "Notekeeper"
+window_width = 1280
+window_height = 800
+
+# ----- audio capture --------------------------------------------------
+[audio]
+channels = 1
+# null = system default. To pin a specific microphone:
+#   * by name: input_device = "MacBook Pro Microphone"
+#   * by index: input_device = 4
+#       (run ``python -c "import sounddevice as sd; print(sd.query_devices())"``
+#        to see what's available)
+# input_device = null
+vad_enabled = true
+vad_threshold = 0.01
+
+# ----- transcription --------------------------------------------------
+[transcription]
+# faster_whisper (local) | openai_audio (cloud) | lmstudio_audio (stub)
+provider = "faster_whisper"
+language = "auto"
+chunk_seconds = 5
+sample_rate = 16000
+
+[faster_whisper]
+# tiny / base / small / medium / large-v2 / large-v3 — bigger = better + slower.
+model = "small"
+# cuda | cpu | auto
+device = "cuda"
+# float16 (CUDA) | int8 / int8_float16 / float32 (CPU)
+compute_type = "float16"
+# When CUDA fails (driver missing, OOM, wrong compute type), retry on CPU.
+allow_cpu_fallback = true
+
+[openai_audio]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "whisper-1"
+
+# Disabled experimental stub — LM Studio doesn't currently expose a
+# real-time audio transcription endpoint. Leave ``enabled = false``
+# unless you've pointed it at a custom server that mirrors the shape.
+[lmstudio_audio]
+base_url = "http://192.168.1.100:1234/v1"
+model = "whisper-local"
+enabled = false
+
+# ----- LLM processing -------------------------------------------------
+[llm]
+# lmstudio | openai | anthropic
+provider = "lmstudio"
+default_task = "clean"
+# Which entry from [[llm_servers]] to use. 0 = first.
+active_server = 0
+
+[lmstudio]
+# Used as the fall-through defaults when [[llm_servers]] is empty or a
+# per-server override is absent.
+base_url = "http://192.168.1.100:1234/v1"
+api_key = "lm-studio"
+model = "local-model-name"
+timeout_seconds = 120
+
+[openai]
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-mini"
+
+[anthropic]
+api_key_env = "ANTHROPIC_API_KEY"
+model = "claude-sonnet-4-5"
+
+# ----- LAN: multiple LM Studio servers --------------------------------
+# When populated, the toolbar gains a "Server" combobox that switches
+# the active backend at runtime. Empty / zero per-server fields fall
+# through to the [lmstudio] block above.
+[[llm_servers]]
+name = "Local 3090 Server"
+base_url = "http://192.168.1.100:1234/v1"
+provider = "lmstudio"
+
+[[llm_servers]]
+name = "Backup Server"
+base_url = "http://192.168.1.101:1234/v1"
+provider = "lmstudio"
+# Override the model for just this server:
+# model = "qwen2.5-coder:32b"
+
+# ----- storage --------------------------------------------------------
+[storage]
+# Relative to ~/.notekeeper/data/, or an absolute path.
+database_path = "notekeeper.db"

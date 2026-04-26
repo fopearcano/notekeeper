@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app import __version__
 from app.audio.recorder import list_input_devices
 from app.config.settings import AppSettings
 from app.llm.commands import (
@@ -158,7 +159,10 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.repository = repository
 
-        self.setWindowTitle(settings.ui.window_title)
+        # Window title carries the version so a screenshot tells you which
+        # build produced a given note. Configurable base label keeps room
+        # for users who rename their personal copy.
+        self.setWindowTitle(f"{settings.ui.window_title} v{__version__}")
         self.resize(settings.ui.window_width, settings.ui.window_height)
 
         # ----- widgets ----------------------------------------------------
@@ -435,6 +439,12 @@ class MainWindow(QMainWindow):
         self.act_test_lmstudio = QAction("Test LM Studio Connection…", self)
         self.act_test_lmstudio.triggered.connect(self._on_test_lmstudio)
         tools.addAction(self.act_test_lmstudio)
+
+        # ----- Help menu --------------------------------------------------
+        help_menu = bar.addMenu("&Help")
+        self.act_about = QAction("&About Notekeeper…", self)
+        self.act_about.triggered.connect(self._on_about)
+        help_menu.addAction(self.act_about)
 
     # ----- worker lifecycle -----------------------------------------------
 
@@ -768,6 +778,26 @@ class MainWindow(QMainWindow):
             )
 
         future.add_done_callback(_done)
+
+    # ----- help / about --------------------------------------------------
+
+    @Slot()
+    def _on_about(self) -> None:
+        """Show a small About dialog with version + active providers."""
+        session = self._session
+        asr = session.transcription_provider.provider_key if session else "—"
+        llm = session.llm_provider.provider_key if session else "—"
+        active_server = self.settings.active_server_label()
+        body = (
+            f"<b>Notekeeper {__version__}</b><br>"
+            "Voice-driven notebook with live transcription and "
+            "LLM-assisted note processing.<br><br>"
+            f"<b>Transcription:</b> {asr}<br>"
+            f"<b>LLM:</b> {llm}<br>"
+            f"<b>Active server:</b> {active_server}<br>"
+            f"<b>Config:</b> ~/.notekeeper/config.toml<br>"
+        )
+        QMessageBox.about(self, "About Notekeeper", body)
 
     # ----- export & clipboard -------------------------------------------
 
