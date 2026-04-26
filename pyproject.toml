@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notekeeper"
+version = "0.1.0"
+description = "Voice-driven notebook with live transcription and LLM-assisted note processing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Notekeeper Contributors" }]
+dependencies = [
+    "PySide6>=6.6",
+    "pydantic>=2.6",
+    "httpx>=0.27",
+    "sounddevice>=0.4.6",
+    "numpy>=1.26",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+faster-whisper = ["faster-whisper>=1.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.4",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+notekeeper = "app.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+"app.config" = ["default_config.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

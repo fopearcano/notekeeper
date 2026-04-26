@@ -1,0 +1,42 @@
+# Notekeeper default configuration.
+#
+# A user-level override may be placed at ~/.config/notekeeper/config.toml.
+# Environment variables (e.g. OPENAI_API_KEY) take precedence over both.
+
+[app]
+name = "Notekeeper"
+log_level = "INFO"
+
+[ui]
+window_title = "Notekeeper"
+window_width = 1280
+window_height = 800
+
+[audio]
+sample_rate = 16000
+channels = 1
+chunk_ms = 30
+device = "default"
+vad_aggressiveness = 2
+
+[transcription]
+# Available providers: "faster_whisper", "openai", "lmstudio_stub"
+provider = "faster_whisper"
+model = "base.en"
+language = "en"
+# How often (ms) the pipeline emits partial transcript updates to the UI.
+emit_interval_ms = 250
+
+[llm]
+# Available providers: "lmstudio", "openai", "anthropic"
+provider = "lmstudio"
+model = "local-model"
+base_url = "http://localhost:1234/v1"
+api_key = ""
+temperature = 0.3
+max_output_tokens = 1024
+request_timeout_s = 60
+
+[storage]
+# Path may be absolute or relative to the user data directory.
+database_path = "notekeeper.db"
