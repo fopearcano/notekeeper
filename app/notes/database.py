@@ -1,7 +1,16 @@
-"""Lightweight SQLite wrapper.
+"""SQLite wrapper.
 
 Uses the standard library ``sqlite3`` module — no external ORM. The schema is
 created idempotently the first time a connection is opened.
+
+Three tables:
+
+* ``notes`` — top-level note record.
+* ``transcript_segments`` — one row per emitted :class:`TranscriptSegment`,
+  keyed by ``note_id``. Replaced wholesale on autosave so the order on disk
+  matches the order the model produced.
+* ``processing_runs`` — one row per LLM task invocation: provider, model,
+  task name, full prompt, and full output. Keeps an audit trail per note.
 """
 
 from __future__ import annotations
@@ -16,23 +25,44 @@ from app.utils.logging import get_logger
 log = get_logger(__name__)
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS notebooks (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL UNIQUE,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-
 CREATE TABLE IF NOT EXISTS notes (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    notebook_id     INTEGER REFERENCES notebooks(id) ON DELETE SET NULL,
     title           TEXT    NOT NULL DEFAULT 'Untitled note',
     raw_transcript  TEXT    NOT NULL DEFAULT '',
     processed_text  TEXT    NOT NULL DEFAULT '',
     created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    source          TEXT    NOT NULL DEFAULT 'recording',
+    language        TEXT,
+    tags_json       TEXT    NOT NULL DEFAULT '[]'
 );
 
-CREATE INDEX IF NOT EXISTS idx_notes_notebook ON notes(notebook_id);
+CREATE TABLE IF NOT EXISTS transcript_segments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id     INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    start_time  REAL    NOT NULL,
+    end_time    REAL    NOT NULL,
+    text        TEXT    NOT NULL,
+    confidence  REAL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_transcript_segments_note
+    ON transcript_segments(note_id);
+
+CREATE TABLE IF NOT EXISTS processing_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id     INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    provider    TEXT    NOT NULL,
+    model       TEXT    NOT NULL,
+    task        TEXT    NOT NULL,
+    prompt      TEXT    NOT NULL,
+    output      TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_processing_runs_note
+    ON processing_runs(note_id);
 """
 
 

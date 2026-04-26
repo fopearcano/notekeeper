@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,12 +36,15 @@ from PySide6.QtWidgets import (
 
 from app.config.settings import AppSettings
 from app.llm.prompt_templates import UI_TASKS
-from app.notes.models import NoteDraft
+from app.notes.models import Note, NoteSummary
 from app.notes.repository import NoteRepository
 from app.services.note_processor import StreamDelta, StreamFinal
 from app.services.session_manager import SessionManager
 from app.ui.widgets import NoteEditor, NotekeeperStatusBar, TranscriptView
 from app.utils.logging import get_logger
+
+#: Autosave cadence while recording (milliseconds).
+AUTOSAVE_INTERVAL_MS = 30_000
 
 log = get_logger(__name__)
 
@@ -105,6 +108,10 @@ class MainWindow(QMainWindow):
     _stream_delta = Signal(str)
     _stream_finished = Signal(str, list)  # title, tags
     _models_listed = Signal(list, str)  # ids, error_message
+    # Persistence events (worker thread → GUI thread).
+    _note_saved = Signal(object)  # Note
+    _note_loaded = Signal(object)  # Note
+    _notes_listed = Signal(list)  # list[NoteSummary]
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         super().__init__()
@@ -115,22 +122,22 @@ class MainWindow(QMainWindow):
         self.resize(settings.ui.window_width, settings.ui.window_height)
 
         # ----- widgets ----------------------------------------------------
-        self.notebook_list = QListWidget()
-        self.notebook_list.addItem(QListWidgetItem("All notes"))
-        self.notebook_list.addItem(QListWidgetItem("(Notebook list placeholder)"))
-        self.notebook_list.setCurrentRow(0)
+        self.notes_list = QListWidget()
+        self.notes_list.setAlternatingRowColors(True)
+        self.notes_list.itemActivated.connect(self._on_note_clicked)
+        self.notes_list.itemClicked.connect(self._on_note_clicked)
 
         self.transcript_view = TranscriptView()
         self.note_editor = NoteEditor()
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.notebook_list)
+        splitter.addWidget(self.notes_list)
         splitter.addWidget(self.transcript_view)
         splitter.addWidget(self.note_editor)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 2)
-        splitter.setSizes([200, 600, 400])
+        splitter.setSizes([220, 600, 400])
 
         container = QWidget()
         from PySide6.QtWidgets import QHBoxLayout
@@ -161,6 +168,11 @@ class MainWindow(QMainWindow):
 
         self._session: Optional[SessionManager] = None
 
+        # ----- autosave timer (GUI thread → worker thread) ----------------
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
+        self._autosave_timer.timeout.connect(self._on_autosave_tick)
+
         # ----- cross-thread signal wiring ---------------------------------
         self._segment_received.connect(self.transcript_view.append_segment)
         self._state_changed.connect(self.status.set_state)
@@ -172,6 +184,9 @@ class MainWindow(QMainWindow):
         self._stream_delta.connect(self.note_editor.append_stream)
         self._stream_finished.connect(self._on_stream_finished)
         self._models_listed.connect(self._show_models_dialog)
+        self._note_saved.connect(self._on_note_saved)
+        self._note_loaded.connect(self._on_note_loaded)
+        self._notes_listed.connect(self._refresh_sidebar)
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -234,12 +249,16 @@ class MainWindow(QMainWindow):
         self._session.add_status_listener(
             lambda message: self._status_received.emit(message)
         )
+        self._session.add_note_saved_listener(
+            lambda note: self._note_saved.emit(note)
+        )
         self.status.set_providers(
             self._session.transcription_provider.provider_key,
             self._session.llm_provider.provider_key,
         )
         self._state_changed.emit("Idle")
         self.status.set_message("Session manager ready")
+        self._reload_notes_async()
 
     # ----- toolbar handlers ------------------------------------------------
 
@@ -255,6 +274,7 @@ class MainWindow(QMainWindow):
         if session is None:
             return
         self.transcript_view.clear()
+        self.note_editor.clear()
         self.act_start.setEnabled(False)
         self.act_stop.setEnabled(True)
         self._state_changed.emit("Recording")
@@ -268,6 +288,7 @@ class MainWindow(QMainWindow):
         else:
             self.status.set_message("Recording started")
         self._submit(session.start(), "Failed to start recording")
+        self._autosave_timer.start()
 
     @Slot()
     def _on_stop(self) -> None:
@@ -275,6 +296,7 @@ class MainWindow(QMainWindow):
         if session is None:
             return
         self.act_stop.setEnabled(False)
+        self._autosave_timer.stop()
 
         async def _do_stop() -> None:
             await session.stop()
@@ -290,19 +312,153 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_save(self) -> None:
-        if self._session is None:
+        session = self._require_session()
+        if session is None:
             return
-        draft = NoteDraft(
-            title=f"Note from {self.windowTitle()}",
-            raw_transcript=self.transcript_view.text(),
-            processed_text=self.note_editor.text(),
+
+        # Snapshot the editor state on the GUI thread, then persist on the
+        # worker thread (the SQLite connection is single-threaded so we keep
+        # writes serialized through the worker).
+        title_hint = self._title_for_save(session)
+        processed = self.note_editor.text()
+
+        async def _do() -> Note:
+            return session.save_note(
+                title=title_hint,
+                processed_text=processed,
+                source="recording",
+            )
+
+        future = self._submit(_do(), "Could not save note")
+        if future is None:
+            return
+
+        def _done(fut) -> None:
+            try:
+                note = fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"Could not save note: {exc}")
+                return
+            self.status.set_message(
+                f"Saved note #{note.id} — {note.title}", timeout_ms=4000
+            )
+
+        future.add_done_callback(_done)
+
+    def _title_for_save(self, session: SessionManager) -> str:
+        if session.current_note is not None and session.current_note.title:
+            return session.current_note.title
+        first_line = next(
+            (l.strip() for l in self.transcript_view.text().splitlines() if l.strip()),
+            "",
         )
-        try:
-            note = self.repository.create_note(draft)
-        except Exception as exc:
-            self._show_error(f"Could not save note: {exc}")
+        return first_line[:60] if first_line else "Untitled note"
+
+    # ----- autosave -----------------------------------------------------
+
+    @Slot()
+    def _on_autosave_tick(self) -> None:
+        session = self._session
+        if session is None:
             return
-        self.status.set_message(f"Saved note #{note.id}")
+
+        async def _do() -> Optional[Note]:
+            return session.autosave()
+
+        future = self._submit(_do(), "Autosave failed")
+        if future is None:
+            return
+
+        def _done(fut) -> None:
+            try:
+                note = fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"Autosave failed: {exc}")
+                return
+            if note is not None:
+                self.status.set_message(
+                    f"Autosaved note #{note.id}", timeout_ms=2000
+                )
+
+        future.add_done_callback(_done)
+
+    # ----- sidebar / load -----------------------------------------------
+
+    def _reload_notes_async(self) -> None:
+        session = self._session
+        if session is None:
+            return
+
+        async def _do() -> list[NoteSummary]:
+            return session.list_notes()
+
+        future = self._submit(_do(), "Could not load note list")
+        if future is None:
+            return
+
+        def _done(fut) -> None:
+            try:
+                summaries = fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"Could not load note list: {exc}")
+                return
+            self._notes_listed.emit(list(summaries))
+
+        future.add_done_callback(_done)
+
+    @Slot(list)
+    def _refresh_sidebar(self, summaries: list) -> None:
+        self.notes_list.clear()
+        for summary in summaries:
+            timestamp = summary.updated_at.strftime("%Y-%m-%d %H:%M")
+            label = f"{summary.title}\n{timestamp}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, summary.id)
+            tooltip_bits = [summary.title, timestamp, f"source: {summary.source}"]
+            if summary.tags:
+                tooltip_bits.append("tags: " + ", ".join(f"#{t}" for t in summary.tags))
+            item.setToolTip("\n".join(tooltip_bits))
+            self.notes_list.addItem(item)
+
+    @Slot(QListWidgetItem)
+    def _on_note_clicked(self, item: QListWidgetItem) -> None:
+        note_id = item.data(Qt.ItemDataRole.UserRole)
+        if note_id is None:
+            return
+        session = self._require_session()
+        if session is None:
+            return
+
+        async def _do() -> Note:
+            return session.load_note(int(note_id))
+
+        future = self._submit(_do(), f"Could not load note {note_id}")
+        if future is None:
+            return
+
+        def _done(fut) -> None:
+            try:
+                note = fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"Could not load note: {exc}")
+                return
+            self._note_loaded.emit(note)
+
+        future.add_done_callback(_done)
+
+    @Slot(object)
+    def _on_note_loaded(self, note: Note) -> None:
+        self.transcript_view.set_text(note.raw_transcript)
+        self.note_editor.load_note(
+            processed_text=note.processed_text,
+            title=note.title,
+            tags=note.tags,
+        )
+        self.status.set_message(f"Loaded note #{note.id} — {note.title}")
+
+    @Slot(object)
+    def _on_note_saved(self, _note: Note) -> None:
+        self._reload_notes_async()
 
     def _on_run_action(self, action: str) -> None:
         session = self._require_session()

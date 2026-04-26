@@ -86,6 +86,7 @@ def test_parse_structured_output_with_meta_block():
     result = parse_structured_output(raw)
     assert result.markdown == "# My note\n\nbody text here"
     assert result.title == "My Title"
+    assert result.title_explicit is True
     assert result.tags == ("meeting", "q4")  # normalised lower-case
     assert META_DELIMITER not in result.markdown
 
@@ -94,6 +95,9 @@ def test_parse_structured_output_without_meta_falls_back_to_first_heading():
     raw = "# A Heading\n\nsome body"
     result = parse_structured_output(raw)
     assert result.title == "A Heading"
+    # Fallback titles must NOT count as explicit so persistence layers don't
+    # overwrite a saved note's title with a derived guess.
+    assert result.title_explicit is False
     assert result.tags == ()
     assert result.markdown == raw.strip()
 
@@ -102,6 +106,19 @@ def test_parse_structured_output_without_heading_uses_first_line():
     raw = "Just a sentence about something\n\nmore text"
     result = parse_structured_output(raw)
     assert result.title == "Just a sentence about something"
+    assert result.title_explicit is False
+
+
+def test_parse_structured_output_empty_meta_title_falls_back():
+    raw = (
+        "body\n\n"
+        f"{META_DELIMITER}\n"
+        '{"title": "", "tags": ["x"]}'
+    )
+    result = parse_structured_output(raw)
+    assert result.title == "body"  # first-line fallback
+    assert result.title_explicit is False
+    assert result.tags == ("x",)
 
 
 def test_parse_structured_output_strips_hash_prefix_from_tags():

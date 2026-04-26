@@ -47,6 +47,11 @@ class TranscriptView(QWidget):
     def clear(self) -> None:
         self._editor.clear()
 
+    @Slot(str)
+    def set_text(self, text: str) -> None:
+        """Replace the visible transcript with ``text`` (used when loading a note)."""
+        self._editor.setPlainText(text)
+
     def text(self) -> str:
         return self._editor.toPlainText()
 

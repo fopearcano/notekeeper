@@ -1,8 +1,16 @@
 """Top-level coordinator for a recording + transcription session.
 
-Owns the audio recorder, the transcript pipeline, and the in-memory
-transcript that the UI displays. The Qt layer drives this from a worker
-thread so the UI never blocks.
+Owns the audio recorder, the transcript pipeline, and the persistent note
+under edit. The Qt layer drives this from a worker thread so the UI never
+blocks; the session manager exposes:
+
+* listener APIs for segments, level meter, warnings, status messages.
+* a single "current note" pointer that the UI uses for sidebar selection
+  and the autosave timer hooks.
+* :meth:`save_note` (manual or autosave) and :meth:`load_note`.
+* :meth:`stream_action` which both streams LLM deltas to the UI and, on
+  completion, updates the current note's processed text / title / tags
+  and records a :class:`ProcessingRun`.
 """
 
 from __future__ import annotations
@@ -15,9 +23,16 @@ from app.audio.audio_buffer import AudioBuffer
 from app.audio.recorder import AudioRecorder
 from app.config.settings import AppSettings
 from app.llm.factory import create_llm_provider
-from app.llm.prompt_templates import StructuredOutput
+from app.llm.prompt_templates import StructuredOutput, render_template
+from app.notes.models import (
+    Note,
+    NoteDraft,
+    NoteSummary,
+    ProcessingRunDraft,
+    SegmentDraft,
+)
 from app.notes.repository import NoteRepository
-from app.services.note_processor import NoteProcessor, StreamEvent
+from app.services.note_processor import NoteProcessor, StreamDelta, StreamFinal
 from app.services.transcript_pipeline import TranscriptPipeline
 from app.transcription.base import TranscriptSegment
 from app.transcription.factory import create_transcription_provider
@@ -29,6 +44,7 @@ SegmentCallback = Callable[[TranscriptSegment], None]
 LevelCallback = Callable[[float], None]
 WarningCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
+NoteSavedCallback = Callable[[Note], None]
 
 
 class SessionState(enum.Enum):
@@ -38,11 +54,7 @@ class SessionState(enum.Enum):
 
 
 class SessionManager:
-    """Coordinates a single recording session.
-
-    Designed to be safe to construct on the UI thread; the heavy lifting
-    happens on the worker loop that the UI passes in via :meth:`start`.
-    """
+    """Coordinates a single recording session and its persistent note."""
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         self.settings = settings
@@ -75,6 +87,14 @@ class SessionManager:
         self._level_listeners: list[LevelCallback] = []
         self._warning_listeners: list[WarningCallback] = []
         self._status_listeners: list[StatusCallback] = []
+        self._note_saved_listeners: list[NoteSavedCallback] = []
+
+        # Persistent note pointer. None = nothing saved yet for this run.
+        self._current_note_id: Optional[int] = None
+        self._current_note: Optional[Note] = None
+        # Track segment count last persisted so autosave can no-op until new
+        # transcript text actually arrives.
+        self._segments_persisted: int = 0
 
         log.info(
             "SessionManager ready (transcription=%s [stub=%s], llm=%s)",
@@ -121,6 +141,15 @@ class SessionManager:
         except ValueError:
             pass
 
+    def add_note_saved_listener(self, listener: NoteSavedCallback) -> None:
+        self._note_saved_listeners.append(listener)
+
+    def remove_note_saved_listener(self, listener: NoteSavedCallback) -> None:
+        try:
+            self._note_saved_listeners.remove(listener)
+        except ValueError:
+            pass
+
     # ----- internal callbacks (run on recorder / pipeline threads) ------
 
     def _on_segment(self, segment: TranscriptSegment) -> None:
@@ -155,8 +184,14 @@ class SessionManager:
                 log.exception("Status listener raised")
 
     def _on_recorder_error(self, message: str) -> None:
-        # Recorder failures are surfaced through the same warning channel.
         self._on_warning(message)
+
+    def _emit_note_saved(self, note: Note) -> None:
+        for cb in list(self._note_saved_listeners):
+            try:
+                cb(note)
+            except Exception:
+                log.exception("Note-saved listener raised")
 
     # ----- transcript inspection ----------------------------------------
 
@@ -169,9 +204,21 @@ class SessionManager:
     def transcription_is_stub(self) -> bool:
         return self.transcription_provider.is_stub
 
+    @property
+    def current_note(self) -> Optional[Note]:
+        return self._current_note
+
     def transcript_text(self) -> str:
         with self._lock:
             return " ".join(s.text for s in self._segments).strip()
+
+    def _snapshot_segments(self) -> list[TranscriptSegment]:
+        with self._lock:
+            return list(self._segments)
+
+    def _segment_count(self) -> int:
+        with self._lock:
+            return len(self._segments)
 
     def clear_transcript(self) -> None:
         with self._lock:
@@ -180,11 +227,15 @@ class SessionManager:
     # ----- lifecycle -----------------------------------------------------
 
     async def start(self) -> None:
+        """Begin a fresh recording — drops any in-memory transcript and current note."""
         with self._lock:
             if self._state == SessionState.RECORDING:
                 return
             self._segments.clear()
             self._state = SessionState.RECORDING
+        self._current_note_id = None
+        self._current_note = None
+        self._segments_persisted = 0
         self.recorder.start()
         self.pipeline.start()
         log.info("Session started")
@@ -201,7 +252,137 @@ class SessionManager:
     async def aclose(self) -> None:
         await self.note_processor.aclose()
 
-    # ----- LLM convenience ----------------------------------------------
+    # ----- persistence ---------------------------------------------------
+
+    @staticmethod
+    def _segments_to_drafts(
+        segments: list[TranscriptSegment],
+    ) -> list[SegmentDraft]:
+        out: list[SegmentDraft] = []
+        for s in segments:
+            confidence = s.metadata.get("language_probability") if s.metadata else None
+            out.append(
+                SegmentDraft(
+                    start_time=float(s.start_s),
+                    end_time=float(s.end_s),
+                    text=s.text,
+                    confidence=(
+                        float(confidence)
+                        if isinstance(confidence, (int, float))
+                        else None
+                    ),
+                )
+            )
+        return out
+
+    def _detected_language(self) -> Optional[str]:
+        """Most-recent non-empty language reported by the transcription provider."""
+        with self._lock:
+            for s in reversed(self._segments):
+                lang = s.metadata.get("language") if s.metadata else None
+                if isinstance(lang, str) and lang:
+                    return lang
+        return None
+
+    def save_note(
+        self,
+        *,
+        title: Optional[str] = None,
+        processed_text: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        source: str = "recording",
+    ) -> Note:
+        """Manual save — creates a note on first call, updates it thereafter."""
+        return self._persist_note(
+            title=title,
+            processed_text=processed_text,
+            tags=tags,
+            source=source,
+            force=True,
+        )
+
+    def autosave(self) -> Optional[Note]:
+        """Persist if there's new transcript content; otherwise no-op.
+
+        Called by the UI's 30-second autosave timer while recording. Returns
+        the saved :class:`Note` or ``None`` when nothing changed.
+        """
+        if self._segment_count() == self._segments_persisted:
+            return None
+        if self._segment_count() == 0:
+            return None
+        return self._persist_note(force=False)
+
+    def load_note(self, note_id: int) -> Note:
+        """Load a saved note as the current pointer (does not touch live state)."""
+        note = self.repository.get_note(note_id)
+        self._current_note_id = note.id
+        self._current_note = note
+        self._segments_persisted = 0  # not relevant for loaded notes
+        return note
+
+    def list_notes(self, *, limit: Optional[int] = None) -> list[NoteSummary]:
+        return self.repository.list_notes(limit=limit)
+
+    def _persist_note(
+        self,
+        *,
+        title: Optional[str] = None,
+        processed_text: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        source: str = "recording",
+        force: bool = True,
+    ) -> Note:
+        segments = self._snapshot_segments()
+        raw = " ".join(s.text for s in segments).strip()
+        language = self._detected_language()
+        # Treat the in-memory segment list as authoritative only when it's
+        # non-empty. Saving while the live pipeline has produced nothing
+        # (e.g. right after loading an existing note) must not wipe the
+        # saved transcript or its persisted segments.
+        has_live_segments = bool(segments)
+
+        if self._current_note_id is None:
+            draft = NoteDraft(
+                title=title or "Untitled note",
+                raw_transcript=raw,
+                processed_text=processed_text or "",
+                source=source,
+                language=language,
+                tags=tags or [],
+            )
+            note = self.repository.create_note(draft)
+            self._current_note_id = note.id
+        else:
+            update_kwargs: dict[str, object] = {}
+            if has_live_segments:
+                update_kwargs["raw_transcript"] = raw
+            if title is not None:
+                update_kwargs["title"] = title
+            if processed_text is not None:
+                update_kwargs["processed_text"] = processed_text
+            if tags is not None:
+                update_kwargs["tags"] = tags
+            if language is not None and has_live_segments:
+                update_kwargs["language"] = language
+            if force:
+                update_kwargs["source"] = source
+            note = self.repository.update_note(self._current_note_id, **update_kwargs)
+
+        if has_live_segments:
+            self.repository.replace_segments(
+                note.id, self._segments_to_drafts(segments)
+            )
+            self._segments_persisted = len(segments)
+        self._current_note = note
+        log.info(
+            "Note %d saved (%d segments, %d chars raw, force=%s, live_segments=%s)",
+            note.id, len(segments), len(raw), force, has_live_segments,
+        )
+        self._emit_note_saved(note)
+        return note
+
+    # ----- LLM ----------------------------------------------------------
 
     async def run_action(
         self,
@@ -213,12 +394,16 @@ class SessionManager:
         """Buffered run — returns the parsed :class:`StructuredOutput`."""
         action = action or self.settings.llm.default_task
         transcript = self.transcript_text()
-        return await self.note_processor.process(
+        result = await self.note_processor.process(
             action=action,
             transcript=transcript,
             title=title,
             instruction=instruction,
         )
+        self._record_processing_run(
+            action=action, transcript=transcript, output=result, instruction=instruction
+        )
+        return result
 
     async def stream_action(
         self,
@@ -227,19 +412,96 @@ class SessionManager:
         instruction: Optional[str] = None,
         title: Optional[str] = None,
     ):
-        """Streaming run — yields ``StreamDelta`` then a final ``StreamFinal``.
+        """Streaming run.
 
-        Wrapped as a plain async generator so callers can ``async for`` it.
+        Yields ``StreamDelta`` events as the model produces them, then a final
+        ``StreamFinal`` carrying the parsed structured output. As a side
+        effect the manager:
+
+        * ensures a current note exists (auto-creating one if needed),
+        * updates the note's processed_text / title / tags,
+        * records a :class:`ProcessingRunDraft` row.
         """
         action = action or self.settings.llm.default_task
         transcript = self.transcript_text()
+        last_final: Optional[StreamFinal] = None
         async for event in self.note_processor.process_streaming(
             action=action,
             transcript=transcript,
             title=title,
             instruction=instruction,
         ):
+            if isinstance(event, StreamFinal):
+                last_final = event
             yield event
+
+        if last_final is not None:
+            self._record_processing_run(
+                action=action,
+                transcript=transcript,
+                output=last_final.output,
+                instruction=instruction,
+            )
+
+    def _record_processing_run(
+        self,
+        *,
+        action: str,
+        transcript: str,
+        output: StructuredOutput,
+        instruction: Optional[str],
+    ) -> None:
+        """Persist a processing run and update the current note's processed fields."""
+        if not transcript.strip():
+            return
+        # Make sure there's a note to attach the run to. If the user runs an
+        # LLM task before saving, create the note implicitly so the run row
+        # has a valid foreign key.
+        if self._current_note_id is None:
+            self._persist_note(force=False)
+
+        note_id = self._current_note_id
+        if note_id is None:
+            return  # _persist_note logged; nothing else we can do.
+
+        system, user = render_template(
+            action, transcript, instruction=instruction
+        )
+        prompt_blob = f"SYSTEM:\n{system}\n\nUSER:\n{user}"
+        try:
+            self.repository.add_processing_run(
+                note_id,
+                ProcessingRunDraft(
+                    provider=self.llm_provider.provider_key,
+                    model=getattr(self.llm_provider, "settings", None)
+                    and getattr(self.llm_provider.settings, "model", "unknown")
+                    or "unknown",
+                    task=action,
+                    prompt=prompt_blob,
+                    output=output.raw or output.markdown,
+                ),
+            )
+        except Exception:
+            log.exception("Failed to persist processing run")
+
+        # Reflect the LLM result on the note row itself. We only overwrite
+        # the saved title when the model *explicitly* emitted one in the
+        # metadata footer — the fallback first-line title from the body is
+        # for display, not for persistence, so running ``clean`` on a
+        # loaded note never destroys the title the user already chose.
+        try:
+            update_kwargs: dict[str, object] = {
+                "processed_text": output.markdown,
+            }
+            if output.title_explicit and output.title:
+                update_kwargs["title"] = output.title
+            if output.tags:
+                update_kwargs["tags"] = list(output.tags)
+            note = self.repository.update_note(note_id, **update_kwargs)
+            self._current_note = note
+            self._emit_note_saved(note)
+        except Exception:
+            log.exception("Failed to update note after LLM run")
 
     async def list_llm_models(self) -> list[str]:
         return await self.llm_provider.list_models()

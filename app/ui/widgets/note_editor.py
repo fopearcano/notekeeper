@@ -72,9 +72,17 @@ class NoteEditor(QWidget):
     @Slot(str, list)
     def end_stream(self, title: str, tags: Iterable[str]) -> None:
         """Show the suggested title / tags below the heading once the stream ends."""
+        self._show_meta(title=title, tags=tags, label="Suggested title")
+
+    def load_note(self, *, processed_text: str, title: str, tags: Iterable[str]) -> None:
+        """Populate the panel from a saved note (no streaming animation)."""
+        self.set_text(processed_text)
+        self._show_meta(title=title, tags=tags, label="Title")
+
+    def _show_meta(self, *, title: str, tags: Iterable[str], label: str) -> None:
         bits: list[str] = []
         if title:
-            bits.append(f"<b>Suggested title:</b> {title}")
+            bits.append(f"<b>{label}:</b> {title}")
         tag_list = list(tags)
         if tag_list:
             tag_str = ", ".join(f"#{t}" for t in tag_list)
@@ -82,3 +90,6 @@ class NoteEditor(QWidget):
         if bits:
             self._meta.setText(" &nbsp; · &nbsp; ".join(bits))
             self._meta.show()
+        else:
+            self._meta.clear()
+            self._meta.hide()

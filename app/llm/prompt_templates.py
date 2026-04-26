@@ -245,12 +245,18 @@ class StructuredOutput:
 
     ``markdown`` is what the UI renders; ``title`` and ``tags`` come from the
     metadata footer (with safe fallbacks if the model omitted it).
+
+    ``title_explicit`` is ``True`` when the model produced a non-empty
+    ``title`` field in the JSON footer, and ``False`` when ``title`` came
+    from the fallback (first heading / first line). Persistence layers that
+    don't want to overwrite a saved note's title should consult this flag.
     """
 
     markdown: str
     title: str = ""
     tags: tuple[str, ...] = ()
     raw: str = ""
+    title_explicit: bool = False
 
 
 _FIRST_HEADING = re.compile(r"^\s*#+\s*(.+?)\s*$", re.MULTILINE)
@@ -297,6 +303,7 @@ def parse_structured_output(text: str) -> StructuredOutput:
     body = raw
     title = ""
     tags: tuple[str, ...] = ()
+    title_explicit = False
 
     if META_DELIMITER in raw:
         body, _, tail = raw.partition(META_DELIMITER)
@@ -310,14 +317,22 @@ def parse_structured_output(text: str) -> StructuredOutput:
             except json.JSONDecodeError:
                 meta = {}
             if isinstance(meta, dict):
-                if isinstance(meta.get("title"), str):
-                    title = meta["title"].strip()
+                meta_title = meta.get("title")
+                if isinstance(meta_title, str) and meta_title.strip():
+                    title = meta_title.strip()
+                    title_explicit = True
                 tags = _normalise_tags(meta.get("tags"))
 
     if not title:
         title = _fallback_title(body)
 
-    return StructuredOutput(markdown=body.strip(), title=title, tags=tags, raw=raw)
+    return StructuredOutput(
+        markdown=body.strip(),
+        title=title,
+        tags=tags,
+        raw=raw,
+        title_explicit=title_explicit,
+    )
 
 
 def split_streaming_chunk(buffer: str) -> tuple[str, str]:
