@@ -15,8 +15,9 @@ from app.audio.audio_buffer import AudioBuffer
 from app.audio.recorder import AudioRecorder
 from app.config.settings import AppSettings
 from app.llm.factory import create_llm_provider
+from app.llm.prompt_templates import StructuredOutput
 from app.notes.repository import NoteRepository
-from app.services.note_processor import NoteProcessor
+from app.services.note_processor import NoteProcessor, StreamEvent
 from app.services.transcript_pipeline import TranscriptPipeline
 from app.transcription.base import TranscriptSegment
 from app.transcription.factory import create_transcription_provider
@@ -202,9 +203,43 @@ class SessionManager:
 
     # ----- LLM convenience ----------------------------------------------
 
-    async def run_action(self, action: Optional[str] = None) -> str:
-        """Process the current transcript with ``action`` (default: configured task)."""
+    async def run_action(
+        self,
+        action: Optional[str] = None,
+        *,
+        instruction: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> StructuredOutput:
+        """Buffered run — returns the parsed :class:`StructuredOutput`."""
         action = action or self.settings.llm.default_task
         transcript = self.transcript_text()
-        result = await self.note_processor.process(action=action, transcript=transcript)
-        return result.text
+        return await self.note_processor.process(
+            action=action,
+            transcript=transcript,
+            title=title,
+            instruction=instruction,
+        )
+
+    async def stream_action(
+        self,
+        action: Optional[str] = None,
+        *,
+        instruction: Optional[str] = None,
+        title: Optional[str] = None,
+    ):
+        """Streaming run — yields ``StreamDelta`` then a final ``StreamFinal``.
+
+        Wrapped as a plain async generator so callers can ``async for`` it.
+        """
+        action = action or self.settings.llm.default_task
+        transcript = self.transcript_text()
+        async for event in self.note_processor.process_streaming(
+            action=action,
+            transcript=transcript,
+            title=title,
+            instruction=instruction,
+        ):
+            yield event
+
+    async def list_llm_models(self) -> list[str]:
+        return await self.llm_provider.list_models()

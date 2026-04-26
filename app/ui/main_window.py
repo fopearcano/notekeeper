@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenuBar,
     QMessageBox,
     QSplitter,
     QToolBar,
@@ -34,10 +35,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.config.settings import AppSettings
+from app.llm.prompt_templates import UI_TASKS
 from app.notes.models import NoteDraft
 from app.notes.repository import NoteRepository
-from app.services.session_manager import SessionManager, SessionState
-from app.transcription.base import TranscriptSegment
+from app.services.note_processor import StreamDelta, StreamFinal
+from app.services.session_manager import SessionManager
 from app.ui.widgets import NoteEditor, NotekeeperStatusBar, TranscriptView
 from app.utils.logging import get_logger
 
@@ -93,12 +95,16 @@ class MainWindow(QMainWindow):
     # Cross-thread plumbing: emitted from non-GUI threads (asyncio worker,
     # PortAudio callback) and consumed in the GUI thread via queued connections.
     _segment_received = Signal(object)
-    _processed_text = Signal(str)
     _state_changed = Signal(str)
     _error_raised = Signal(str)
     _level_received = Signal(float)
     _warning_received = Signal(str)
     _status_received = Signal(str)
+    # LLM streaming (worker thread → GUI thread).
+    _stream_started = Signal()
+    _stream_delta = Signal(str)
+    _stream_finished = Signal(str, list)  # title, tags
+    _models_listed = Signal(list, str)  # ids, error_message
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         super().__init__()
@@ -141,8 +147,9 @@ class MainWindow(QMainWindow):
         # is up in case the provider keys ever differ from the bare config.
         self.status.set_providers(settings.transcription.provider, settings.llm.provider)
 
-        # ----- toolbar -----------------------------------------------------
+        # ----- toolbar + menu bar ----------------------------------------
         self._build_toolbar()
+        self._build_menu_bar()
 
         # ----- async plumbing ---------------------------------------------
         self._worker_thread = QThread(self)
@@ -156,14 +163,27 @@ class MainWindow(QMainWindow):
 
         # ----- cross-thread signal wiring ---------------------------------
         self._segment_received.connect(self.transcript_view.append_segment)
-        self._processed_text.connect(self.note_editor.set_text)
         self._state_changed.connect(self.status.set_state)
         self._error_raised.connect(self._show_error)
         self._level_received.connect(self.status.set_level)
         self._warning_received.connect(self._on_warning)
         self._status_received.connect(self._on_status)
+        self._stream_started.connect(self.note_editor.begin_stream)
+        self._stream_delta.connect(self.note_editor.append_stream)
+        self._stream_finished.connect(self._on_stream_finished)
+        self._models_listed.connect(self._show_models_dialog)
 
     # ----- toolbar ---------------------------------------------------------
+
+    #: Display labels for the LLM task toolbar buttons.
+    _TASK_LABELS: dict[str, str] = {
+        "clean": "Clean",
+        "summarize": "Summarize",
+        "organize": "Organize",
+        "format_markdown": "Format Markdown",
+        "extract_tasks": "Extract Tasks",
+        "generate_title": "Generate Title",
+    }
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main", self)
@@ -173,28 +193,29 @@ class MainWindow(QMainWindow):
         self.act_start = QAction("Start Recording", self)
         self.act_stop = QAction("Stop Recording", self)
         self.act_save = QAction("Save Note", self)
-        self.act_summarize = QAction("Summarize", self)
-        self.act_organize = QAction("Organize", self)
-        self.act_format = QAction("Format", self)
-
         self.act_stop.setEnabled(False)
-
-        for act in (
-            self.act_start,
-            self.act_stop,
-            self.act_save,
-            self.act_summarize,
-            self.act_organize,
-            self.act_format,
-        ):
+        for act in (self.act_start, self.act_stop, self.act_save):
             tb.addAction(act)
+        tb.addSeparator()
+
+        self._task_actions: dict[str, QAction] = {}
+        for task in UI_TASKS:
+            label = self._TASK_LABELS.get(task, task.replace("_", " ").title())
+            action = QAction(label, self)
+            action.triggered.connect(lambda _checked=False, t=task: self._on_run_action(t))
+            tb.addAction(action)
+            self._task_actions[task] = action
 
         self.act_start.triggered.connect(self._on_start)
         self.act_stop.triggered.connect(self._on_stop)
         self.act_save.triggered.connect(self._on_save)
-        self.act_summarize.triggered.connect(lambda: self._on_run_action("summarize"))
-        self.act_organize.triggered.connect(lambda: self._on_run_action("organize"))
-        self.act_format.triggered.connect(lambda: self._on_run_action("format"))
+
+    def _build_menu_bar(self) -> None:
+        bar: QMenuBar = self.menuBar()
+        tools = bar.addMenu("&Tools")
+        self.act_test_lmstudio = QAction("Test LM Studio Connection…", self)
+        self.act_test_lmstudio.triggered.connect(self._on_test_lmstudio)
+        tools.addAction(self.act_test_lmstudio)
 
     # ----- worker lifecycle -----------------------------------------------
 
@@ -291,25 +312,97 @@ class MainWindow(QMainWindow):
         if not transcript:
             self._show_error("Nothing to process — record or paste a transcript first.")
             return
-        self.status.set_message(f"Running {action}…", timeout_ms=0)
 
-        async def _do() -> str:
-            return await session.run_action(action)
+        label = self._TASK_LABELS.get(action, action)
+        self._set_tasks_enabled(False)
+        self._stream_started.emit()
+        self.status.set_message(f"{label}…", timeout_ms=0)
 
-        future = self._submit(_do(), f"{action} failed")
+        async def _drive() -> tuple[str, list[str]]:
+            title = ""
+            tags: list[str] = []
+            async for event in session.stream_action(action):
+                if isinstance(event, StreamDelta):
+                    self._stream_delta.emit(event.text)
+                elif isinstance(event, StreamFinal):
+                    title = event.output.title
+                    tags = list(event.output.tags)
+            return title, tags
+
+        future = self._submit(_drive(), f"{action} failed")
+        if future is None:
+            self._set_tasks_enabled(True)
+            return
+
+        def _done(fut) -> None:
+            self._set_tasks_enabled(True)
+            try:
+                title, tags = fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"{label} failed: {exc}")
+                return
+            self._stream_finished.emit(title, tags)
+            self.status.set_message(f"{label} done", timeout_ms=4000)
+
+        future.add_done_callback(_done)
+
+    def _set_tasks_enabled(self, enabled: bool) -> None:
+        for action in self._task_actions.values():
+            action.setEnabled(enabled)
+
+    @Slot(str, list)
+    def _on_stream_finished(self, title: str, tags: list) -> None:
+        self.note_editor.end_stream(title, tags)
+
+    # ----- Test LM Studio connection --------------------------------------
+
+    @Slot()
+    def _on_test_lmstudio(self) -> None:
+        session = self._require_session()
+        if session is None:
+            return
+        self.status.set_message("Querying LM Studio /v1/models…", timeout_ms=0)
+
+        async def _do() -> list[str]:
+            return await session.list_llm_models()
+
+        future = self._submit(_do(), "Test connection failed")
         if future is None:
             return
 
         def _done(fut) -> None:
             try:
-                result = fut.result()
+                models = fut.result()
             except Exception as exc:
-                self._error_raised.emit(f"{action} failed: {exc}")
+                self._models_listed.emit([], str(exc))
                 return
-            self._processed_text.emit(result)
-            self.status.set_message(f"{action.capitalize()} done")
+            self._models_listed.emit(list(models), "")
 
         future.add_done_callback(_done)
+
+    @Slot(list, str)
+    def _show_models_dialog(self, models: list, error: str) -> None:
+        if error:
+            QMessageBox.warning(
+                self,
+                "LM Studio connection",
+                f"Could not reach the LM Studio server at "
+                f"{self.settings.lmstudio.base_url}:\n\n{error}",
+            )
+            self.status.set_message("LM Studio connection failed", timeout_ms=5000)
+            return
+        if not models:
+            text = (
+                "Connected to LM Studio, but the server reported no loaded "
+                "models. Load a model in LM Studio's GUI and try again."
+            )
+        else:
+            joined = "\n".join(f"  • {m}" for m in models)
+            text = f"Available models on LM Studio:\n\n{joined}"
+        QMessageBox.information(self, "LM Studio connection", text)
+        self.status.set_message(
+            f"LM Studio: {len(models)} model(s) available", timeout_ms=4000
+        )
 
     # ----- helpers ---------------------------------------------------------
 
