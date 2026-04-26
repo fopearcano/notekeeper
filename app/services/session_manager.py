@@ -782,3 +782,22 @@ class SessionManager:
         # The repo orders by ascending created_at; reverse so the freshest
         # entry is on top of the dropdown.
         return list(reversed(runs))
+
+    def export_payload(self):
+        """Return the bundle the export functions need for the current note.
+
+        Returns ``None`` when there's no current note saved yet — the UI
+        should refuse export in that case rather than synthesise a draft.
+        """
+        from app.services.exporters import ExportPayload  # local: avoid cycle
+
+        if self._current_note is None:
+            return None
+        note_id = self._current_note.id
+        return ExportPayload(
+            note=self._current_note,
+            segments=self.repository.list_segments(note_id),
+            # Repo returns oldest-first, which matches the order users want
+            # to read processing history in chronologically.
+            processing_runs=self.repository.list_processing_runs(note_id),
+        )

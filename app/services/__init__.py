@@ -7,6 +7,15 @@ from app.services.connection_tester import (
     probe_openai,
     probe_transcription,
 )
+from app.services.exporters import (
+    ExportPayload,
+    safe_filename,
+    to_json,
+    to_markdown,
+    to_pdf_bytes,
+    to_text,
+    write_export,
+)
 from app.services.health_monitor import (
     HealthMonitor,
     HealthSnapshot,
@@ -18,6 +27,7 @@ from app.services.session_manager import SessionManager
 from app.services.transcript_pipeline import TranscriptPipeline
 
 __all__ = [
+    "ExportPayload",
     "HealthMonitor",
     "HealthSnapshot",
     "LLMServerStatus",
@@ -29,5 +39,11 @@ __all__ = [
     "probe_lmstudio",
     "probe_openai",
     "probe_transcription",
+    "safe_filename",
+    "to_json",
+    "to_markdown",
+    "to_pdf_bytes",
+    "to_text",
     "with_retry",
+    "write_export",
 ]

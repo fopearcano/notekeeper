@@ -18,6 +18,7 @@ blocks. UI updates are delivered back to the GUI thread via Qt signals.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -35,6 +37,7 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QSplitter,
     QToolBar,
     QVBoxLayout,
@@ -53,6 +56,11 @@ from app.llm.commands import (
 from app.llm.prompt_templates import UI_TASKS
 from app.notes.models import Note, NoteSummary, ProcessingRun
 from app.notes.repository import NoteRepository
+from app.services.exporters import (
+    ExportPayload,
+    safe_filename,
+    write_export,
+)
 from app.services.note_processor import StreamDelta, StreamFinal
 from app.services.session_manager import SessionManager
 from app.ui.dialogs import DiagnosticsDialog, SettingsDialog
@@ -164,15 +172,29 @@ class MainWindow(QMainWindow):
         self.command_bar = CommandBar()
         self.history_dropdown = HistoryDropdown()
 
+        # Three export buttons live just below the command bar so they sit
+        # right next to the processed-note panel they act on.
+        self.export_md_button = QPushButton("Export Markdown")
+        self.export_txt_button = QPushButton("Export TXT")
+        self.export_json_button = QPushButton("Export JSON")
+        from PySide6.QtWidgets import QHBoxLayout as _QHBoxLayout
+
+        export_row = _QHBoxLayout()
+        export_row.setContentsMargins(0, 0, 0, 0)
+        export_row.addWidget(self.export_md_button)
+        export_row.addWidget(self.export_txt_button)
+        export_row.addWidget(self.export_json_button)
+        export_row.addStretch(1)
+
         # Right column: history picker on top, processed-note editor in the
-        # middle, command bar at the bottom (where the user's eye lands when
-        # they finish reading the result).
+        # middle, command bar above the export-button row at the bottom.
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self.history_dropdown)
         right_layout.addWidget(self.note_editor, stretch=1)
         right_layout.addWidget(self.command_bar)
+        right_layout.addLayout(export_row)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.notes_list)
@@ -242,6 +264,9 @@ class MainWindow(QMainWindow):
         self._dialog_result.connect(self._deliver_dialog_result)
         self._settings_applied.connect(self._on_settings_applied)
         self._health_received.connect(self.status.set_llm_health)
+        self.export_md_button.clicked.connect(lambda: self._on_export("md"))
+        self.export_txt_button.clicked.connect(lambda: self._on_export("txt"))
+        self.export_json_button.clicked.connect(lambda: self._on_export("json"))
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -351,6 +376,49 @@ class MainWindow(QMainWindow):
 
     def _build_menu_bar(self) -> None:
         bar: QMenuBar = self.menuBar()
+
+        # ----- File menu --------------------------------------------------
+        file_menu = bar.addMenu("&File")
+
+        self.act_export_md = QAction("Export &Markdown…", self)
+        self.act_export_md.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        self.act_export_md.triggered.connect(lambda: self._on_export("md"))
+        file_menu.addAction(self.act_export_md)
+
+        self.act_export_txt = QAction("Export &Text…", self)
+        self.act_export_txt.setShortcut(QKeySequence("Ctrl+Shift+T"))
+        self.act_export_txt.triggered.connect(lambda: self._on_export("txt"))
+        file_menu.addAction(self.act_export_txt)
+
+        self.act_export_json = QAction("Export &JSON…", self)
+        self.act_export_json.setShortcut(QKeySequence("Ctrl+Shift+J"))
+        self.act_export_json.triggered.connect(lambda: self._on_export("json"))
+        file_menu.addAction(self.act_export_json)
+
+        self.act_export_pdf = QAction("Export &PDF…", self)
+        self.act_export_pdf.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        self.act_export_pdf.triggered.connect(lambda: self._on_export("pdf"))
+        file_menu.addAction(self.act_export_pdf)
+
+        # ----- Edit menu --------------------------------------------------
+        edit_menu = bar.addMenu("&Edit")
+
+        self.act_copy_processed = QAction("Copy &Processed Note", self)
+        self.act_copy_processed.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        self.act_copy_processed.triggered.connect(self._on_copy_processed)
+        edit_menu.addAction(self.act_copy_processed)
+
+        self.act_copy_transcript = QAction("Copy Raw &Transcript", self)
+        self.act_copy_transcript.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        self.act_copy_transcript.triggered.connect(self._on_copy_transcript)
+        edit_menu.addAction(self.act_copy_transcript)
+
+        self.act_copy_selection = QAction("Copy &Selected Text", self)
+        self.act_copy_selection.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.act_copy_selection.triggered.connect(self._on_copy_selection)
+        edit_menu.addAction(self.act_copy_selection)
+
+        # ----- Tools menu -------------------------------------------------
         tools = bar.addMenu("&Tools")
 
         self.act_settings = QAction("&Settings…", self)
@@ -700,6 +768,103 @@ class MainWindow(QMainWindow):
             )
 
         future.add_done_callback(_done)
+
+    # ----- export & clipboard -------------------------------------------
+
+    _EXPORT_FILTERS: dict[str, str] = {
+        "md": "Markdown (*.md)",
+        "txt": "Plain text (*.txt)",
+        "json": "JSON (*.json)",
+        "pdf": "PDF (*.pdf)",
+    }
+
+    _EXPORT_SUFFIXES: dict[str, str] = {
+        "md": ".md",
+        "txt": ".txt",
+        "json": ".json",
+        "pdf": ".pdf",
+    }
+
+    def _on_export(self, fmt: str) -> None:
+        """Common entry point for the four export formats."""
+        session = self._require_session()
+        if session is None:
+            return
+        payload: ExportPayload | None = session.export_payload()
+        if payload is None:
+            self._show_error(
+                "Save the current note first — there's nothing to export yet."
+            )
+            return
+
+        suffix = self._EXPORT_SUFFIXES[fmt]
+        default_name = safe_filename(payload.note.title, suffix=suffix)
+        path_str, _selected = QFileDialog.getSaveFileName(
+            self,
+            f"Export {fmt.upper()}",
+            default_name,
+            self._EXPORT_FILTERS[fmt],
+        )
+        if not path_str:
+            return  # user cancelled
+        path = Path(path_str)
+        if path.suffix.lower() != suffix:
+            # Add the suffix the user implicitly accepted via the filter.
+            path = path.with_suffix(suffix)
+
+        try:
+            write_export(path, payload, fmt)
+        except Exception as exc:
+            self._show_error(f"Could not write {path}: {exc}")
+            return
+        self.status.set_message(
+            f"Exported to {path}", timeout_ms=5000
+        )
+
+    @Slot()
+    def _on_copy_processed(self) -> None:
+        text = self.note_editor.text()
+        self._set_clipboard(text, label="processed note")
+
+    @Slot()
+    def _on_copy_transcript(self) -> None:
+        text = self.transcript_view.text()
+        self._set_clipboard(text, label="raw transcript")
+
+    @Slot()
+    def _on_copy_selection(self) -> None:
+        # Prefer the focused widget's selection when it has one; fall back
+        # to whichever editor has *any* selection.
+        focus = QApplication.focusWidget()
+        text = ""
+        for src in (focus, self.transcript_view, self.note_editor):
+            if src is None:
+                continue
+            getter = getattr(src, "selected_text", None)
+            if callable(getter):
+                value = getter()
+                if value and value.strip():
+                    text = value
+                    break
+        if not text:
+            self.status.set_message(
+                "Nothing selected — drag a range in a panel first.",
+                timeout_ms=3000,
+            )
+            return
+        self._set_clipboard(text, label="selection")
+
+    def _set_clipboard(self, text: str, *, label: str) -> None:
+        if not text:
+            self.status.set_message(f"No {label} to copy.", timeout_ms=3000)
+            return
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        char_count = len(text)
+        self.status.set_message(
+            f"Copied {label} ({char_count:,} char{'s' if char_count != 1 else ''})",
+            timeout_ms=3000,
+        )
 
     # ----- diagnostics dialog -------------------------------------------
 
