@@ -749,7 +749,9 @@ class MainWindow(QMainWindow):
             return  # the "single server" fallback row
         if session.state.value in ("recording", "paused"):
             self._show_error(
-                "Stop the recording before switching LM Studio servers."
+                "Server switch deferred — stop the current recording first "
+                "(toolbar Stop, or Ctrl+R) so the new server isn't asked to "
+                "transcribe a stream it didn't see the start of."
             )
             # Roll the combo back to whatever's actually live.
             self._populate_server_combo()
@@ -1241,7 +1243,9 @@ class MainWindow(QMainWindow):
             return
         if session.state.value in ("recording", "paused"):
             self._show_error(
-                "Stop the recording before applying new settings."
+                "Settings not applied — stop the current recording first "
+                "(toolbar Stop, or Ctrl+R). Live audio settings can't safely "
+                "change while the pipeline is consuming chunks."
             )
             return
 
@@ -1345,15 +1349,77 @@ class MainWindow(QMainWindow):
     # ----- helpers ---------------------------------------------------------
 
     def _submit(self, coro, error_label: str):
+        """Schedule ``coro`` on the worker loop, returning the future or None.
+
+        Returning ``None`` means the operation could not be scheduled
+        (no session yet, or the worker isn't accepting work). The
+        coroutine is closed in that case so it doesn't leak a
+        warning.
+        """
         if self._session is None:
-            self._show_error("Session not ready")
+            self._show_error(
+                "Notekeeper hasn't finished starting yet — wait a moment "
+                "and try again."
+            )
             coro.close()
             return None
         try:
             return self._worker.submit(coro)
         except Exception as exc:
             self._error_raised.emit(f"{error_label}: {exc}")
+            log.exception("Worker submission failed for %s", error_label)
             return None
+
+    def _run_on_worker(
+        self,
+        coro,
+        *,
+        on_success=None,
+        error_label: str = "Operation failed",
+        on_finally=None,
+    ):
+        """Schedule ``coro`` and wire a uniform done-callback.
+
+        ``on_success`` and ``on_finally`` run on the worker thread when
+        the future completes — they should emit Qt signals (not touch
+        widgets directly) if they need to update the UI. Failures are
+        funnelled through ``_error_raised`` with ``error_label`` as the
+        prefix, so every async path produces the same shape of error
+        dialog.
+
+        Currently used by new call sites; the legacy hand-rolled
+        callbacks scattered through ``_on_*`` slots can migrate to this
+        helper one at a time without changing behaviour.
+        """
+        future = self._submit(coro, error_label)
+        if future is None:
+            if on_finally is not None:
+                try:
+                    on_finally()
+                except Exception:
+                    log.exception("on_finally raised for %s", error_label)
+            return None
+
+        def _done(fut) -> None:
+            if on_finally is not None:
+                try:
+                    on_finally()
+                except Exception:
+                    log.exception("on_finally raised for %s", error_label)
+            try:
+                result = fut.result()
+            except Exception as exc:
+                self._error_raised.emit(f"{error_label}: {exc}")
+                log.exception("Async error in %s", error_label)
+                return
+            if on_success is not None:
+                try:
+                    on_success(result)
+                except Exception:
+                    log.exception("on_success raised for %s", error_label)
+
+        future.add_done_callback(_done)
+        return future
 
     @Slot(str)
     def _show_error(self, message: str) -> None:
@@ -1374,17 +1440,56 @@ class MainWindow(QMainWindow):
     # ----- close ----------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Stop the async worker and release session resources."""
+        """Stop the worker thread and release every owned resource.
+
+        Idempotent — ``closeEvent`` and an explicit ``shutdown()`` from a
+        test both go through the same single-pass tear-down. Order:
+
+        1. Stop the GUI-side timers so they don't fire mid-shutdown.
+        2. ``await SessionManager.aclose()`` on the worker loop, which
+           stops recording, drains the pipeline, halts the health
+           monitor, and closes the LLM httpx client.
+        3. Stop the worker loop and join its QThread.
+
+        ``aclose`` itself is idempotent so a slow shutdown that times
+        out doesn't leave the next call in an inconsistent state.
+        """
+        if getattr(self, "_shutdown_complete", False):
+            return
+        self._shutdown_complete = True
+
+        # Quiet the GUI-thread timers first — anything they would have
+        # tried to ``submit`` after this point would race the worker stop.
+        try:
+            self._autosave_timer.stop()
+        except Exception:
+            log.exception("Error stopping autosave timer")
+        try:
+            self._elapsed_timer.stop()
+        except Exception:
+            log.exception("Error stopping elapsed timer")
+
         if self._session is not None:
             try:
                 future = self._worker.submit(self._session.aclose())
-                future.result(timeout=2.0)
+                # 5 s is enough to stop a recording, drain the pipeline,
+                # and close httpx — but bounded so a stuck network call
+                # can't pin the close button forever.
+                future.result(timeout=5.0)
             except Exception:
-                log.exception("Error closing session")
+                log.exception("Error closing session during shutdown")
             self._session = None
-        self._worker.stop()
+
+        try:
+            self._worker.stop()
+        except Exception:
+            log.exception("Error stopping worker loop")
         self._worker_thread.quit()
-        self._worker_thread.wait(2000)
+        if not self._worker_thread.wait(3000):
+            log.warning("Worker QThread did not exit within 3 s; terminating.")
+            self._worker_thread.terminate()
+            self._worker_thread.wait(1000)
+        log.info("Shutdown complete")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self.shutdown()

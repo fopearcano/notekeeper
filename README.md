@@ -62,6 +62,101 @@ On first launch Notekeeper:
 
 ---
 
+## Architecture
+
+A short tour of how a recording becomes a saved note. See
+[`DEVELOPING.md`](DEVELOPING.md) for the conventions you'll need to add a
+new provider, command, or UI panel.
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          GUI thread (PySide6)                            │
+│                                                                          │
+│   MainWindow ── toolbar / menus / shortcuts / dialogs                    │
+│        │                                                                 │
+│        │ Qt signals (queued connections)                                 │
+│        ▼                                                                 │
+│   AsyncWorker (QThread)                                                  │
+└────────┼──────────────────────────────────────────────────────────────────┘
+         │
+         ▼  asyncio loop
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         Worker thread                                    │
+│                                                                          │
+│   SessionManager  ── owns:                                               │
+│     • AudioRecorder ──► PortAudio worker thread (mic callback)           │
+│     • TranscriptPipeline ──► transcription provider (faster-whisper / …) │
+│     • NoteProcessor ──► LLM provider (LM Studio / OpenAI / Anthropic)    │
+│     • HealthMonitor ──► periodic /v1/models probe                        │
+│     • NoteRepository ──► SQLite                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Three threads are involved on every recording:**
+
+1. **GUI thread** runs Qt and the toolbar / menus / dialogs. It must
+   never call into a network or file API directly.
+2. **AsyncWorker QThread** owns a long-lived `asyncio` event loop.
+   `MainWindow._submit(coro, label)` schedules coroutines onto this loop
+   via `asyncio.run_coroutine_threadsafe`, and `_run_on_worker(...)`
+   wires a uniform done-callback that funnels failures through the
+   `_error_raised` Qt signal.
+3. **PortAudio worker thread** is created by `sounddevice.InputStream`.
+   The audio callback runs there; it's intentionally lean — bytearray
+   accumulation + RMS + a single `AudioBuffer.push` per finished chunk —
+   so the OS mic thread never stalls.
+
+**Cross-thread events** all flow through one of two mechanisms:
+
+* **Qt signals with queued connections** for events that need the GUI
+  thread (segment append, level meter, status messages, health snapshots,
+  command-bar streaming deltas). Slots run on the GUI thread no matter
+  which thread emitted the signal.
+* **`ListenerList[T]`** (`app/utils/listeners.py`) for in-process
+  publish/subscribe inside the worker — used by `SessionManager` for its
+  seven channels (segments, level, warnings, status, chunk events,
+  note-saved, health). Listener exceptions are logged but never block
+  the publisher.
+
+**A microphone chunk's life cycle:**
+
+1. `sounddevice.InputStream` callback fires (PortAudio thread) → mono
+   downmix → `ChunkAssembler.feed(...)` → optional emit of an
+   `AudioChunk` to `AudioBuffer`.
+2. `TranscriptPipeline._chunk_iter` (worker loop) pops the chunk, runs
+   `VoiceActivityDetector.classify`. Silent chunks emit a `"skipped"`
+   chunk-event and never reach the provider.
+3. `provider.stream(...)` yields `TranscriptSegment` objects. Each one
+   gets a session-relative `received_s` timestamp stamped into
+   `metadata`, then dispatches to subscribed listeners. The pipeline
+   emits a `"transcribed"` chunk-event so the UI clears its
+   "transcribing…" placeholder.
+4. The session manager appends the segment to its in-memory list and
+   forwards it to the GUI via the segment Qt signal.
+
+**A `/summarize` command's life cycle:**
+
+1. `CommandBar.command_submitted` fires on the GUI thread.
+2. `MainWindow._on_command_submitted` resolves the verb via
+   `app.llm.commands.resolve_command(...)` and gathers text (selection
+   first, then full transcript).
+3. The driver coroutine is submitted to the AsyncWorker via
+   `_submit(...)`. `SessionManager.stream_action` flips the LM Studio
+   health status to `GENERATING`, calls
+   `note_processor.process_streaming(...)`, and yields `StreamDelta`
+   events. Each delta is forwarded to the GUI via `_stream_delta`.
+4. On completion the manager records a `ProcessingRun` row, updates
+   the note's processed text / title / tags, fires a fresh health probe,
+   and the GUI's `_stream_finished` signal repaints the metadata footer.
+
+**Graceful shutdown** (`MainWindow.shutdown`) is single-pass and
+idempotent: stop GUI timers → submit `SessionManager.aclose()` to the
+worker (which stops recording, drains the pipeline, halts the health
+monitor, closes the LLM httpx client) → stop the worker loop → join the
+QThread.
+
+---
+
 ## Layout
 
 ```

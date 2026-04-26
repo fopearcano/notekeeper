@@ -42,6 +42,7 @@ from app.services.note_processor import NoteProcessor, StreamDelta, StreamFinal
 from app.services.transcript_pipeline import TranscriptPipeline
 from app.transcription.base import TranscriptSegment
 from app.transcription.factory import create_transcription_provider
+from app.utils.listeners import ListenerList
 from app.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -96,14 +97,29 @@ class SessionManager:
         self._state = SessionState.IDLE
         self._lock = threading.Lock()
         self._segments: list[TranscriptSegment] = []
+        self._closed = False
 
-        self._segment_listeners: list[SegmentCallback] = []
-        self._level_listeners: list[LevelCallback] = []
-        self._warning_listeners: list[WarningCallback] = []
-        self._status_listeners: list[StatusCallback] = []
-        self._note_saved_listeners: list[NoteSavedCallback] = []
-        self._chunk_event_listeners: list[ChunkEventCallback] = []
-        self._health_listeners: list[HealthCallback] = []
+        # Subscription channels — one ListenerList per event kind. The public
+        # ``add_*_listener`` / ``remove_*_listener`` methods delegate here so
+        # the locking + exception swallowing live in one place.
+        self._segments_channel: ListenerList[TranscriptSegment] = ListenerList(
+            label="segment"
+        )
+        self._level_channel: ListenerList[float] = ListenerList(label="level")
+        self._warnings_channel: ListenerList[str] = ListenerList(label="warning")
+        self._status_channel: ListenerList[str] = ListenerList(label="status")
+        self._note_saved_channel: ListenerList[Note] = ListenerList(label="note-saved")
+        self._chunk_events_channel: ListenerList[
+            tuple[str, float, float]
+        ] = ListenerList(label="chunk")
+        # Track add→adapter mapping so ``remove_chunk_event_listener`` can
+        # find the wrapper function the channel actually stored.
+        self._chunk_event_adapters: dict[ChunkEventCallback, Callable[
+            [tuple[str, float, float]], None
+        ]] = {}
+        self._health_channel: ListenerList[HealthSnapshot] = ListenerList(
+            label="health"
+        )
         self.health_monitor.add_listener(self._on_health_snapshot)
 
         # Persistent note pointer. None = nothing saved yet for this run.
@@ -121,63 +137,56 @@ class SessionManager:
         )
 
     # ----- subscription --------------------------------------------------
+    #
+    # All subscription methods delegate to a per-channel :class:`ListenerList`
+    # for thread-safe add / remove / notify with consistent exception handling.
 
     def add_segment_listener(self, listener: SegmentCallback) -> None:
-        self._segment_listeners.append(listener)
+        self._segments_channel.add(listener)
 
     def remove_segment_listener(self, listener: SegmentCallback) -> None:
-        try:
-            self._segment_listeners.remove(listener)
-        except ValueError:
-            pass
+        self._segments_channel.remove(listener)
 
     def add_level_listener(self, listener: LevelCallback) -> None:
-        self._level_listeners.append(listener)
+        self._level_channel.add(listener)
 
     def remove_level_listener(self, listener: LevelCallback) -> None:
-        try:
-            self._level_listeners.remove(listener)
-        except ValueError:
-            pass
+        self._level_channel.remove(listener)
 
     def add_warning_listener(self, listener: WarningCallback) -> None:
-        self._warning_listeners.append(listener)
+        self._warnings_channel.add(listener)
 
     def remove_warning_listener(self, listener: WarningCallback) -> None:
-        try:
-            self._warning_listeners.remove(listener)
-        except ValueError:
-            pass
+        self._warnings_channel.remove(listener)
 
     def add_status_listener(self, listener: StatusCallback) -> None:
-        self._status_listeners.append(listener)
+        self._status_channel.add(listener)
 
     def remove_status_listener(self, listener: StatusCallback) -> None:
-        try:
-            self._status_listeners.remove(listener)
-        except ValueError:
-            pass
+        self._status_channel.remove(listener)
 
     def add_note_saved_listener(self, listener: NoteSavedCallback) -> None:
-        self._note_saved_listeners.append(listener)
+        self._note_saved_channel.add(listener)
 
     def remove_note_saved_listener(self, listener: NoteSavedCallback) -> None:
-        try:
-            self._note_saved_listeners.remove(listener)
-        except ValueError:
-            pass
+        self._note_saved_channel.remove(listener)
 
     def add_chunk_event_listener(self, listener: ChunkEventCallback) -> None:
-        self._chunk_event_listeners.append(listener)
+        # ChunkEventCallback takes three args; the channel stores tuples.
+        def _adapter(payload: tuple[str, float, float]) -> None:
+            listener(*payload)
+
+        # Track the adapter under the user's listener so ``remove`` works.
+        self._chunk_event_adapters[listener] = _adapter
+        self._chunk_events_channel.add(_adapter)
 
     def remove_chunk_event_listener(self, listener: ChunkEventCallback) -> None:
-        try:
-            self._chunk_event_listeners.remove(listener)
-        except ValueError:
-            pass
+        adapter = self._chunk_event_adapters.pop(listener, None)
+        if adapter is not None:
+            self._chunk_events_channel.remove(adapter)
 
     def add_health_listener(self, listener: HealthCallback) -> None:
-        self._health_listeners.append(listener)
+        self._health_channel.add(listener)
         # Replay current snapshot for late subscribers (Qt signal connections
         # are made after SessionManager is constructed).
         try:
@@ -186,67 +195,35 @@ class SessionManager:
             log.exception("Health listener raised on attach")
 
     def remove_health_listener(self, listener: HealthCallback) -> None:
-        try:
-            self._health_listeners.remove(listener)
-        except ValueError:
-            pass
+        self._health_channel.remove(listener)
 
     def _on_health_snapshot(self, snapshot: HealthSnapshot) -> None:
-        for cb in list(self._health_listeners):
-            try:
-                cb(snapshot)
-            except Exception:
-                log.exception("Health UI listener raised")
+        self._health_channel.notify(snapshot)
 
     # ----- internal callbacks (run on recorder / pipeline threads) ------
 
     def _on_segment(self, segment: TranscriptSegment) -> None:
         with self._lock:
             self._segments.append(segment)
-            listeners = list(self._segment_listeners)
-        for cb in listeners:
-            try:
-                cb(segment)
-            except Exception:
-                log.exception("Segment UI listener raised")
+        self._segments_channel.notify(segment)
 
     def _on_level(self, level: float) -> None:
-        for cb in list(self._level_listeners):
-            try:
-                cb(level)
-            except Exception:
-                log.exception("Level listener raised")
+        self._level_channel.notify(level)
 
     def _on_warning(self, message: str) -> None:
-        for cb in list(self._warning_listeners):
-            try:
-                cb(message)
-            except Exception:
-                log.exception("Warning listener raised")
+        self._warnings_channel.notify(message)
 
     def _on_status(self, message: str) -> None:
-        for cb in list(self._status_listeners):
-            try:
-                cb(message)
-            except Exception:
-                log.exception("Status listener raised")
+        self._status_channel.notify(message)
 
     def _on_recorder_error(self, message: str) -> None:
         self._on_warning(message)
 
     def _on_chunk_event(self, kind: str, timestamp: float, rms: float) -> None:
-        for cb in list(self._chunk_event_listeners):
-            try:
-                cb(kind, timestamp, rms)
-            except Exception:
-                log.exception("Chunk-event listener raised")
+        self._chunk_events_channel.notify((kind, timestamp, rms))
 
     def _emit_note_saved(self, note: Note) -> None:
-        for cb in list(self._note_saved_listeners):
-            try:
-                cb(note)
-            except Exception:
-                log.exception("Note-saved listener raised")
+        self._note_saved_channel.notify(note)
 
     # ----- transcript inspection ----------------------------------------
 
@@ -293,8 +270,10 @@ class SessionManager:
         """
         if self.recorder.is_recording:
             self._on_warning(
-                "Microphone selection cannot be changed while recording — "
-                "stop the session first."
+                "Microphone selection ignored — stop the current recording "
+                "(toolbar Stop button or Ctrl+R) before switching devices, "
+                "otherwise the open audio stream would have to be torn down "
+                "mid-capture."
             )
             return
         self.settings.audio.input_device = device
@@ -380,8 +359,38 @@ class SessionManager:
         log.info("Session cleared")
 
     async def aclose(self) -> None:
-        await self.health_monitor.stop()
-        await self.note_processor.aclose()
+        """Tear everything down. Idempotent — safe to call from ``shutdown``.
+
+        Order matters:
+
+        1. Stop recording first so the audio callback can't push more
+           chunks after the pipeline is gone.
+        2. Stop the pipeline so any in-flight provider call settles.
+        3. Stop the periodic health monitor so its asyncio task
+           releases the worker loop.
+        4. Close the LLM provider's httpx client.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        if self._state in (SessionState.RECORDING, SessionState.PAUSED):
+            try:
+                await self.stop()
+            except Exception:
+                log.exception("Error stopping recording during aclose")
+
+        try:
+            await self.health_monitor.stop()
+        except Exception:
+            log.exception("Error stopping health monitor")
+
+        try:
+            await self.note_processor.aclose()
+        except Exception:
+            log.exception("Error closing LLM provider")
+
+        log.info("SessionManager closed")
 
     async def apply_settings(self, new_settings: AppSettings) -> None:
         """Replace the live providers / recorder config from ``new_settings``.
@@ -404,7 +413,9 @@ class SessionManager:
         """
         if self._state in (SessionState.RECORDING, SessionState.PAUSED):
             raise RuntimeError(
-                "Stop the recording before applying new settings."
+                "Stop the recording before applying new settings — "
+                "live audio settings (sample rate, chunk seconds, "
+                "transcription provider) can't safely change mid-stream."
             )
 
         # Tear down the old LLM client so its httpx connection pool closes

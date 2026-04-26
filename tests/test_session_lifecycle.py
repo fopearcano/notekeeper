@@ -176,7 +176,8 @@ def test_set_input_device_blocked_while_recording(session):
     asyncio.run(_do())
 
     assert session.settings.audio.input_device == 3
-    assert any("cannot be changed while recording" in w for w in warnings)
+    # The exact wording was tightened — assert on the stable substring.
+    assert any("Microphone selection ignored" in w for w in warnings)
 
 
 def test_set_input_device_applies_when_idle(session):
