@@ -20,6 +20,7 @@ log = get_logger(__name__)
 
 class OpenAIAudioProvider(TranscriptionProvider):
     provider_key = "openai_audio"
+    is_stub = True  # not implemented yet — pipeline will warn
 
     def __init__(
         self,

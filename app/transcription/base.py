@@ -34,6 +34,11 @@ class TranscriptionProvider(ABC):
     #: Short identifier used for status display (e.g. ``"faster_whisper"``).
     provider_key: str = "unknown"
 
+    #: Set ``True`` when the provider does not actually transcribe audio
+    #: (placeholder/scripted output, or a not-yet-implemented backend). The
+    #: UI surfaces this as a warning so users know transcription isn't real.
+    is_stub: bool = False
+
     @property
     def name(self) -> str:
         return self.__class__.__name__

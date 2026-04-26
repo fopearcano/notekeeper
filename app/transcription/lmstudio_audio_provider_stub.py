@@ -24,6 +24,7 @@ log = get_logger(__name__)
 
 class LMStudioAudioProviderStub(TranscriptionProvider):
     provider_key = "lmstudio_audio"
+    is_stub = True
 
     def __init__(
         self,

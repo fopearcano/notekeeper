@@ -27,6 +27,8 @@ _DEMO_PHRASES = [
 
 class FasterWhisperProvider(TranscriptionProvider):
     provider_key = "faster_whisper"
+    # Until WhisperModel is wired up the provider emits scripted phrases.
+    is_stub = True
 
     def __init__(
         self,

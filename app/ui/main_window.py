@@ -90,11 +90,14 @@ class AsyncWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    # Cross-thread plumbing: emitted from the worker thread, consumed in the GUI thread.
+    # Cross-thread plumbing: emitted from non-GUI threads (asyncio worker,
+    # PortAudio callback) and consumed in the GUI thread via queued connections.
     _segment_received = Signal(object)
     _processed_text = Signal(str)
     _state_changed = Signal(str)
     _error_raised = Signal(str)
+    _level_received = Signal(float)
+    _warning_received = Signal(str)
 
     def __init__(self, settings: AppSettings, repository: NoteRepository):
         super().__init__()
@@ -155,6 +158,8 @@ class MainWindow(QMainWindow):
         self._processed_text.connect(self.note_editor.set_text)
         self._state_changed.connect(self.status.set_state)
         self._error_raised.connect(self._show_error)
+        self._level_received.connect(self.status.set_level)
+        self._warning_received.connect(self._on_warning)
 
     # ----- toolbar ---------------------------------------------------------
 
@@ -197,6 +202,12 @@ class MainWindow(QMainWindow):
         self._session.add_segment_listener(
             lambda seg: self._segment_received.emit(seg)
         )
+        self._session.add_level_listener(
+            lambda level: self._level_received.emit(level)
+        )
+        self._session.add_warning_listener(
+            lambda message: self._warning_received.emit(message)
+        )
         self.status.set_providers(
             self._session.transcription_provider.provider_key,
             self._session.llm_provider.provider_key,
@@ -221,7 +232,15 @@ class MainWindow(QMainWindow):
         self.act_start.setEnabled(False)
         self.act_stop.setEnabled(True)
         self._state_changed.emit("Recording")
-        self.status.set_message("Recording started")
+        if session.transcription_is_stub:
+            self.status.set_message(
+                f"Recording started — transcription provider "
+                f"'{session.transcription_provider.provider_key}' is in stub mode "
+                "(no real transcripts).",
+                timeout_ms=8000,
+            )
+        else:
+            self.status.set_message("Recording started")
         self._submit(session.start(), "Failed to start recording")
 
     @Slot()
@@ -304,6 +323,12 @@ class MainWindow(QMainWindow):
     def _show_error(self, message: str) -> None:
         log.error(message)
         QMessageBox.warning(self, "Notekeeper", message)
+
+    @Slot(str)
+    def _on_warning(self, message: str) -> None:
+        """Non-modal warning surface — shown in the status bar instead of a dialog."""
+        log.warning(message)
+        self.status.set_message(message, timeout_ms=8000)
 
     # ----- close ----------------------------------------------------------
 
